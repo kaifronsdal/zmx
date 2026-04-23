@@ -85,6 +85,69 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_exe_unit_tests.step);
     }
 
+    // zmyth (rewrite under src2/)
+    {
+        const exe2_mod = b.createModule(.{
+            .root_source_file = b.path("src2/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        exe2_mod.addOptions("build_options", options);
+        if (b.lazyDependency("ghostty", .{
+            .target = target,
+            .optimize = optimize,
+        })) |dep| {
+            exe2_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+        }
+        const exe2 = b.addExecutable(.{
+            .name = "zmyth",
+            .root_module = exe2_mod,
+        });
+        exe2.linkLibC();
+        b.installArtifact(exe2);
+        const step2 = b.step("zmyth", "Build the zmyth rewrite");
+        step2.dependOn(&b.addInstallArtifact(exe2, .{}).step);
+
+        const test2_mod = b.createModule(.{
+            .root_source_file = b.path("src2/test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        test2_mod.addOptions("build_options", options);
+        if (b.lazyDependency("ghostty", .{
+            .target = target,
+            .optimize = optimize,
+        })) |dep| {
+            test2_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+        }
+        const test2 = b.addTest(.{ .root_module = test2_mod });
+        test2.linkLibC();
+        const run_test2 = b.addRunArtifact(test2);
+        const test2_step = b.step("test2", "Run src2/ unit tests");
+        test2_step.dependOn(&run_test2.step);
+
+        // Integration smoke tests: build zmyth, then drive it via bash.
+        const install_exe2 = b.addInstallArtifact(exe2, .{});
+        const itest = b.addSystemCommand(&.{"bash"});
+        itest.addFileArg(b.path("test/integration/smoke.sh"));
+        itest.setEnvironmentVariable("ZMX", b.getInstallPath(.bin, "zmyth"));
+        itest.has_side_effects = true; // never cache: spawns daemons, uses /tmp
+        itest.step.dependOn(&install_exe2.step);
+        const itest_step = b.step("test-integration", "Build zmyth and run integration smoke tests");
+        itest_step.dependOn(&itest.step);
+
+        // Prompt-engine matrix: bash/zsh/fish × none/starship/oh-my-posh.
+        // Separate step because it may download engine binaries on a fresh
+        // host; not part of the default test-integration target.
+        const petest = b.addSystemCommand(&.{"bash"});
+        petest.addFileArg(b.path("test/integration/prompt_engines.sh"));
+        petest.setEnvironmentVariable("ZMX", b.getInstallPath(.bin, "zmyth"));
+        petest.has_side_effects = true;
+        petest.step.dependOn(&install_exe2.step);
+        const petest_step = b.step("test-prompt-engines", "Build zmyth and run the prompt-engine integration matrix");
+        petest_step.dependOn(&petest.step);
+    }
+
     // Check for LSP integration
     {
         const check = b.step("check", "Check if zmx compiles");
