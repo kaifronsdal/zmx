@@ -169,9 +169,10 @@ def main():
     env = dict(os.environ)
     env["ZMYTH_DIR"] = tmpdir
     env["XDG_STATE_HOME"] = os.path.join(tmpdir, "state")
-    # Prefer PATH bash (brew bash 5.x on macOS) over /bin/bash (3.2 on macOS,
-    # whose readline lacks bracketed-paste and trips several prompt-sync checks).
-    env["SHELL"] = shutil.which("bash") or "/bin/bash"
+    # Use whatever $SHELL the user has (zsh on stock macOS; bash 5+ on most
+    # Linux). Do NOT force /bin/bash: on macOS that's bash 3.2, whose readline
+    # lacks bracketed-paste, so `run`'s typed commands become `200~cmd201~`.
+    env["SHELL"] = os.environ.get("SHELL") or shutil.which("zsh") or shutil.which("bash") or "/bin/sh"
     env["TERM"] = "xterm-256color"
     env.pop("ZMYTH_SESSION", None)
 

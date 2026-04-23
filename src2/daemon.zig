@@ -734,10 +734,11 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             if (d.write_state != null) {
                 return queueErr(c, "run: write in progress", .{});
             }
-            // The locally-spawned shell is one we don't know how to hook,
-            // and no nested shell has announced either. `run` would hang
-            // forever waiting for a prompt-ready signal that never comes.
-            if (d.spawned_shell == .unknown and
+            // The locally-spawned shell is one we don't know how to hook
+            // (e.g. dash, or bash <4 which announces as `bash-pre4`), and no
+            // nested shell has announced either. `run` would hang forever
+            // waiting for a prompt-ready signal that never comes.
+            if ((d.spawned_shell == .unknown or d.session.unhookable) and
                 !d.session.hooked and !d.session.seen_prompt)
             {
                 try queueErr(

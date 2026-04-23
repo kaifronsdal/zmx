@@ -104,9 +104,16 @@ pub fn spawnShell(
     switch (shell) {
         .bash => {
             const rc = try std.fmt.allocPrint(arena, "{s}/bashrc", .{rc_dir});
+            // bash <4 (notably macOS /bin/bash = 3.2) lacks bracketed-paste:
+            // the verbatim-paste inject becomes literal `200~...201~` and
+            // `run`'s typed commands are mangled the same way. Announce as
+            // an unrecognised shell so the daemon refuses `run` cleanly
+            // instead of producing `200~true201~: command not found`.
             const body = try std.fmt.allocPrint(
                 arena,
-                "[ -f ~/.bashrc ] && . ~/.bashrc\n" ++ announce,
+                "[ -f ~/.bashrc ] && . ~/.bashrc\n" ++
+                    "if [ \"${{BASH_VERSINFO[0]:-0}}\" -ge 4 ]; then\n  " ++ announce ++
+                    "else\n  printf '\\033]2718;hello;bash-pre4\\007'\nfi\n",
                 .{"bash"},
             );
             try writeFile(rc, body);

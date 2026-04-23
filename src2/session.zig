@@ -81,6 +81,9 @@ pub const Session = struct {
 
     // Shell-integration state — orthogonal flags, not an FSM.
     shell: protocol.Shell = .unknown,
+    /// A `hello` arrived naming a shell we can't hook (e.g. bash <4 announces
+    /// as `bash-pre4`). `run` should fail fast rather than wait 30s.
+    unhookable: bool = false,
     /// First `done` OSC seen → hook is installed and emitting.
     hooked: bool = false,
     /// nanoTimestamp when `hooked` flipped false→true. checkAcceptanceTimeout
@@ -163,7 +166,11 @@ pub const Session = struct {
         for (self.events.items) |ev| switch (ev) {
             .hello => |sh| {
                 self.shell = sh;
-                if (sh == .unknown) continue;
+                if (sh == .unknown) {
+                    self.unhookable = true;
+                    continue;
+                }
+                self.unhookable = false;
                 const inj = try protocol.buildInject(self.gpa, sh, &self.nonce);
                 defer self.gpa.free(inj);
                 try self.pty_input.appendSlice(self.gpa, inj);
@@ -379,8 +386,11 @@ pub const Session = struct {
         // Hard timeout only applies before the shell has ever signalled
         // readiness. Once hooked/seen_prompt, an unsent request is queued
         // behind a running command which may legitimately take hours — never
-        // fail it, just warn below.
-        if (!self.hooked and !self.seen_prompt and waited >= 30 * std.time.ns_per_s) {
+        // fail it, just warn below. If the shell has explicitly announced as
+        // unhookable (e.g. bash <4), fail immediately rather than wait 30s.
+        if (!self.hooked and !self.seen_prompt and
+            (self.unhookable or waited >= 30 * std.time.ns_per_s))
+        {
             // Nothing can be sent before readiness, so r is front().
             const req = self.popFront();
             const cid = req.client_id;
@@ -775,7 +785,23 @@ test "hello with unknown shell skips inject" {
     defer s.deinit();
     try s.feedPtyOutput("\x1b]2718;hello;powershell\x07");
     try testing.expectEqual(protocol.Shell.unknown, s.shell);
+    try testing.expect(s.unhookable);
     try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
+}
+
+test "unhookable hello fails queued run immediately (bash <4 path)" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    // Cold-start race: run arrives before hello.
+    try s.queueRun(5, "true");
+    try testing.expect(!s.run_queue.items[0].sent);
+    // bash 3.2 rc shim announces as bash-pre4 → .unknown → unhookable.
+    try s.feedPtyOutput("\x1b]2718;hello;bash-pre4\x07");
+    try testing.expect(s.unhookable);
+    // checkPromptWait should fail it now, not in 30s.
+    const r = s.checkPromptWait(s.run_queue.items[0].queued_ns + std.time.ns_per_ms);
+    try testing.expectEqual(@as(u32, 5), r.timeout);
+    try testing.expectEqual(@as(usize, 0), s.run_queue.items.len);
 }
 
 test "resize clamps absurd dimensions" {
