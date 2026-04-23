@@ -155,7 +155,7 @@ pub const Session = struct {
     pub fn feedPtyOutput(self: *Session, bytes: []const u8) !void {
         // See doc on the `stream` field.
         self.stream.handler.terminal = &self.term;
-        try self.stream.nextSlice(bytes);
+        self.stream.nextSlice(bytes);
 
         self.events.clearRetainingCapacity();
         try self.scanner.feed(bytes, &self.events);

@@ -46,8 +46,8 @@ pub fn spawnShell(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Base env: inherit parent + ZMYTH_SESSION + ZMYTH_HOOK_NONCE + TERM (if unset)
-    // + indirected refresh keys pointing at <env_dir>/<KEY>.
+    // Base env: inherit parent + ZMYTH_SESSION + TERM (if unset) + indirected
+    // refresh keys pointing at <env_dir>/<KEY>.
     var env: std.ArrayList([*:0]const u8) = .empty;
     {
         var ptr = std.c.environ;
@@ -66,9 +66,6 @@ pub fn spawnShell(
         }
     }
     try env.append(arena, try std.fmt.allocPrintSentinel(arena, "ZMYTH_SESSION={s}", .{name}, 0));
-    // The session nonce is deliberately NOT exported to the environment: the
-    // hook receives it via template substitution at inject time, and putting
-    // it in env would let every child process forge done/preexec OSCs.
     if (posix.getenv("TERM") == null) {
         try env.append(arena, "TERM=xterm-256color");
     }

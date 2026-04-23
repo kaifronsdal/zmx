@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addOptions("build_options", options);
 
     if (b.lazyDependency("ghostty", .{
+        .@"emit-lib-vt" = true,
         .target = target,
         .optimize = optimize,
     })) |dep| {
@@ -70,6 +71,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         if (b.lazyDependency("ghostty", .{
+        .@"emit-lib-vt" = true,
             .target = target,
             .optimize = optimize,
         })) |dep| {
@@ -94,6 +96,7 @@ pub fn build(b: *std.Build) void {
         });
         exe2_mod.addOptions("build_options", options);
         if (b.lazyDependency("ghostty", .{
+        .@"emit-lib-vt" = true,
             .target = target,
             .optimize = optimize,
         })) |dep| {
@@ -115,6 +118,7 @@ pub fn build(b: *std.Build) void {
         });
         test2_mod.addOptions("build_options", options);
         if (b.lazyDependency("ghostty", .{
+        .@"emit-lib-vt" = true,
             .target = target,
             .optimize = optimize,
         })) |dep| {
@@ -182,6 +186,7 @@ pub fn build(b: *std.Build) void {
             release_mod.addOptions("build_options", options);
 
             if (b.lazyDependency("ghostty", .{
+        .@"emit-lib-vt" = true,
                 .target = resolved,
                 .optimize = .ReleaseSafe,
             })) |dep| {
