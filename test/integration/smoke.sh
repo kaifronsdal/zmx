@@ -29,6 +29,16 @@ nuke() { for n in "$@"; do "$ZMX" kill -9 "$n" >/dev/null 2>&1; done; sleep 0.1;
 [ -x "$ZMX" ] || { echo "FATAL: $ZMX not executable"; exit 1; }
 command -v jq >/dev/null || { echo "FATAL: jq required"; exit 1; }
 
+# ── Portability shims (macOS/BSD) ───────────────────────────────────────────
+# `timeout` is GNU-coreutils-only; macOS lacks it unless coreutils is brewed.
+# perl is always present on macOS, so alarm+exec gives us a drop-in for the
+# `timeout N cmd args...` form used below (no flags, integer seconds).
+if ! command -v timeout >/dev/null; then
+  timeout() { perl -e 'alarm shift; exec @ARGV' -- "$@"; }
+fi
+# `stat -c %a` is GNU; BSD stat spells it `-f %Lp`.
+sock_perms() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+
 # Helper: extract a field from the trailing -j line of `run` output.
 # Usage: jrun <field> <args...>   (echoes field value, returns run's ec)
 jrun() {
@@ -38,8 +48,9 @@ jrun() {
   return $ec
 }
 
-# Helper: monotonic ms
-now_ms() { date +%s%N | sed 's/.\{6\}$//'; }
+# Helper: monotonic ms. BSD date has no %N, so use python3 (already required
+# for scenarios 33/36 and attach_test.py).
+now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Basic exit codes (bash). Auto-creates session.
@@ -416,7 +427,7 @@ check "33  socket path >108 -> ec!=0, mentions length/long/path (got: $err)" \
 #     caller's umask, so other users on the box can't connect.
 # ─────────────────────────────────────────────────────────────────────────────
 ( umask 000; "$ZMX" run h34 -- true >/dev/null 2>&1 )
-perm=$(stat -c %a "$ZMYTH_DIR/h34.sock" 2>/dev/null || echo 999)
+perm=$(sock_perms "$ZMYTH_DIR/h34.sock" 2>/dev/null || echo 999)
 check "34  umask 000 -> socket perms <=700 (got $perm)" "[ '$perm' -le 700 ]"
 nuke h34
 
@@ -457,17 +468,29 @@ check "36b connections released -> run succeeds" "[ $ec -eq 0 ]"
 nuke h36
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 37/38 require bash ≥4 for bracketed-paste support. macOS /bin/bash is 3.2,
+# so prefer `command -v bash` (picks up brew bash 5.x on PATH) and skip if the
+# resolved bash is still <4.
+# ─────────────────────────────────────────────────────────────────────────────
+BASH_BIN=$(command -v bash)
+BASH_MAJOR=$("$BASH_BIN" -c 'echo ${BASH_VERSINFO[0]}')
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 37. bash `set -o vi`, prompt left in NORMAL mode: typeCommand's ^U and
 #     ESC[200~ are unbound in the default vi-command keymap, so the wrapper
 #     would be parsed as vi motions. hook.bash must bind them in vi-command.
 # ─────────────────────────────────────────────────────────────────────────────
-home37=$(mktemp -d); printf 'set -o vi\n' >"$home37/.bashrc"
-HOME="$home37" SHELL=/bin/bash "$ZMX" run h37 -- true >/dev/null
-printf '\033' | "$ZMX" send h37 -   # ESC -> readline vi NORMAL mode
-sleep 0.6                           # > readline keyseq-timeout (500ms)
-timeout 10 "$ZMX" run -j h37 -- '(exit 7)' >/dev/null
-check "37  bash vi-mode, prompt in NORMAL -> run ec=7" "[ $? -eq 7 ]"
-rm -rf "$home37"; nuke h37
+if [ "$BASH_MAJOR" -ge 4 ]; then
+  home37=$(mktemp -d); printf 'set -o vi\n' >"$home37/.bashrc"
+  HOME="$home37" SHELL="$BASH_BIN" "$ZMX" run h37 -- true >/dev/null
+  printf '\033' | "$ZMX" send h37 -   # ESC -> readline vi NORMAL mode
+  sleep 0.6                           # > readline keyseq-timeout (500ms)
+  timeout 10 "$ZMX" run -j h37 -- '(exit 7)' >/dev/null
+  check "37  bash vi-mode, prompt in NORMAL -> run ec=7" "[ $? -eq 7 ]"
+  rm -rf "$home37"; nuke h37
+else
+  echo "SKIP: 37 (bash $BASH_MAJOR.x lacks bracketed-paste; need >=4)"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 38. bash `set enable-bracketed-paste off`: readline never emits ?2004h and
@@ -475,12 +498,16 @@ rm -rf "$home37"; nuke h37
 #     on so `run`'s bracketed-paste wrapper and the ?2004h prompt fallback
 #     both work.
 # ─────────────────────────────────────────────────────────────────────────────
-home38=$(mktemp -d)
-printf "bind 'set enable-bracketed-paste off'\n" >"$home38/.bashrc"
-via=$(HOME="$home38" SHELL=/bin/bash jrun via h38 -- '(exit 3)'); ec=$?
-check "38  bash enable-bracketed-paste off -> run ec=3 via osc_done" \
-      "[ $ec -eq 3 ] && [ '$via' = osc_done ]"
-rm -rf "$home38"; nuke h38
+if [ "$BASH_MAJOR" -ge 4 ]; then
+  home38=$(mktemp -d)
+  printf "bind 'set enable-bracketed-paste off'\n" >"$home38/.bashrc"
+  via=$(HOME="$home38" SHELL="$BASH_BIN" jrun via h38 -- '(exit 3)'); ec=$?
+  check "38  bash enable-bracketed-paste off -> run ec=3 via osc_done" \
+        "[ $ec -eq 3 ] && [ '$via' = osc_done ]"
+  rm -rf "$home38"; nuke h38
+else
+  echo "SKIP: 38 (bash $BASH_MAJOR.x lacks bracketed-paste; need >=4)"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo

@@ -19,6 +19,7 @@ import time
 import fcntl
 import errno
 import select
+import shutil
 import signal
 import struct
 import termios
@@ -168,7 +169,9 @@ def main():
     env = dict(os.environ)
     env["ZMYTH_DIR"] = tmpdir
     env["XDG_STATE_HOME"] = os.path.join(tmpdir, "state")
-    env["SHELL"] = "/bin/bash"
+    # Prefer PATH bash (brew bash 5.x on macOS) over /bin/bash (3.2 on macOS,
+    # whose readline lacks bracketed-paste and trips several prompt-sync checks).
+    env["SHELL"] = shutil.which("bash") or "/bin/bash"
     env["TERM"] = "xterm-256color"
     env.pop("ZMYTH_SESSION", None)
 
@@ -360,6 +363,8 @@ def main():
             except StopIteration:
                 pass
             time.sleep(0.05)
+        if not alt_on:
+            print("DEBUG alt scrollback:", subprocess.run([ZMX, "read", "alt", "-n", "20"], env=env, capture_output=True, text=True).stdout, file=sys.stderr)
         check("alt-gate: vi flips alt_screen=true", alt_on,
               extra=repr(ls_json()))
 
