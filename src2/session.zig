@@ -197,11 +197,17 @@ pub const Session = struct {
     last_exit: ?i32 = null,
     last_cwd: [std.fs.max_path_bytes]u8 = undefined,
     last_cwd_len: usize = 0,
+    /// Most recent OSC 133;D exit code, consumed by the next prompt-fallback
+    /// completion. Cleared by `done` (which is authoritative when present).
+    osc133_exit: ?i32 = null,
 
-    /// Number of `.attach`ed clients (maintained by daemon on accept/reap).
-    /// When zero, ghostty's shadow terminal answers DSR/DA/etc. queries on
-    /// the app's behalf; when nonzero, the real terminal answers via
-    /// passthrough and ghostty stays silent to avoid double replies.
+    /// Number of `.attach`ed clients whose write backlog is under the demote
+    /// threshold — i.e., clients whose real terminal can plausibly answer a
+    /// DSR/DA query via passthrough. Recomputed by the daemon before each
+    /// `feedPtyOutput`. When zero, ghostty's shadow terminal answers on the
+    /// app's behalf (`vtWritePty`); when nonzero, ghostty stays silent so the
+    /// app doesn't see two replies. A stalled attach (half-open SSH) doesn't
+    /// count, since it can't relay the query.
     attached_clients: u32 = 0,
 
     /// In-flight `zmyth hook` install (probe → install → wait for done).
@@ -270,6 +276,11 @@ pub const Session = struct {
         for (self.events.items) |ev| switch (ev) {
             .hello => |h| try self.onHello(h.shell, h.pid),
             .probe => |p| try self.onProbe(p),
+            .pwd => |p| self.setLastCwd(p),
+            .osc133_end => |ec| {
+                self.osc133_exit = ec;
+                if (ec) |e| self.last_exit = e;
+            },
             .preexec => |pid| self.onPreexec(pid),
             .done => |d| try self.onDone(d.pid, d.exit_code, d.dur_ms, d.cwd),
             .prompt => try self.onPrompt(),
@@ -397,9 +408,8 @@ pub const Session = struct {
 
     fn onDone(self: *Session, pid: i32, ec: i32, dur_ms: u64, cwd: []const u8) !void {
         self.last_exit = ec;
-        const n = @min(cwd.len, self.last_cwd.len);
-        @memcpy(self.last_cwd[0..n], cwd[0..n]);
-        self.last_cwd_len = n;
+        self.osc133_exit = null; // `done` is authoritative
+        self.setLastCwd(cwd);
 
         // Route by pid: known layer below top → that layer's child chain has
         // exited; pop down. Unknown pid → a freshly-hooked nested shell (file-
@@ -480,11 +490,15 @@ pub const Session = struct {
                 });
                 return;
             }
-            // Unhooked top: ?2004h is the only "back at prompt" signal.
+            // Unhooked top: ?2004h is the only "back at prompt" signal. If the
+            // shell emitted OSC 133;D (starship/omp do) we have a real exit
+            // code; otherwise null.
             if (!t.hooked) {
                 const req = self.removeReq(r);
+                const ec = self.osc133_exit;
+                self.osc133_exit = null;
                 try self.complete(req, .{
-                    .exit_code = null,
+                    .exit_code = ec,
                     .via = .prompt_fallback,
                     .dur_ms = msSince(req.started_ns, std.time.nanoTimestamp()),
                 });
@@ -715,12 +729,6 @@ pub const Session = struct {
     /// been seen. starship/oh-my-posh emit these; useful as a passive
     /// "shell has *some* integration" flag in unhooked sessions.
     //
-    // ghostty's handler also surfaces OSC 133;D's exit code and OSC 7's cwd
-    // via `Stream.Action.{semantic_prompt,report_pwd}` — but only transiently
-    // to a custom handler, not to `Terminal` state. A wrapper handler could
-    // let degraded `run` report real exit codes and `ls -j` show cwd in
-    // unhooked sessions. Deferred (separate from `vtWritePty`: those are
-    // app→host notifications, not query replies).
     pub fn osc133Seen(self: *const Session) bool {
         // Primary screen, not active: OSC 133 is a shell-prompt thing and
         // the shell lives on the primary screen.
@@ -759,6 +767,12 @@ pub const Session = struct {
 
     pub fn lastCwd(self: *const Session) []const u8 {
         return self.last_cwd[0..self.last_cwd_len];
+    }
+
+    fn setLastCwd(self: *Session, cwd: []const u8) void {
+        const n = @min(cwd.len, self.last_cwd.len);
+        @memcpy(self.last_cwd[0..n], cwd[0..n]);
+        self.last_cwd_len = n;
     }
 
     // ───────────────────────── hook install ─────────────────────────
@@ -1818,6 +1832,33 @@ test "headless: query NOT answered when an attach client is present" {
     s.attached_clients = 0;
     try s.feedPtyOutput("\x1b[6n");
     try testing.expect(s.pendingPtyInput().len > 0);
+}
+
+test "OSC 7 updates lastCwd in unhooked session" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    // Degraded (unhooked) session: our `done` OSC never arrives, but the
+    // shell's own OSC 7 does.
+    try s.feedPtyOutput("\x1b[?2004h");
+    try testing.expectEqualStrings("", s.lastCwd());
+    try s.feedPtyOutput("\x1b]7;file://host/home/u\x07");
+    try testing.expectEqualStrings("/home/u", s.lastCwd());
+}
+
+test "OSC 133;D updates last_exit and completes degraded run" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try s.feedPtyOutput("\x1b[?2004h");
+    try s.queueRun(1, "false", false);
+    try testing.expect(s.run_queue.items[0].sent);
+    // Shell with starship/omp emits 133;D;<ec> then ?2004h. Degraded `run`
+    // currently completes via .prompt_fallback with ec=null; with 133;D it
+    // should report the real exit code.
+    try s.feedPtyOutput("\x1b]133;D;1\x07\x1b[?2004h");
+    const c = s.completions();
+    try testing.expectEqual(@as(usize, 1), c.len);
+    try testing.expectEqual(@as(?i32, 1), c[0].result.exit_code);
+    try testing.expectEqual(@as(?i32, 1), s.last_exit);
 }
 
 test "ghostty-tracked state: title, mouse, osc133" {

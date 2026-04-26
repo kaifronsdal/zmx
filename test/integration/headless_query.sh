@@ -53,6 +53,48 @@ case "$out" in
 esac
 
 "$ZMYTH" kill hq -9 2>/dev/null
+
+# ─── Stalled attach client must not suppress headless replies ────────────────
+# An attach client whose terminal is catatonic (half-open SSH) won't relay the
+# query to a real terminal. The daemon should treat it as "not really there"
+# for write_pty purposes, same as it does for leader election.
+echo "── DSR with a stalled (non-draining) attach client ──"
+out=$(python3 - "$ZMYTH" "$ROOT" "$PROBE" <<'PY'
+import os, sys, pty, fcntl, struct, termios, time, subprocess, re
+ZMYTH, ROOT, PROBE = sys.argv[1], sys.argv[2], sys.argv[3]
+env = dict(os.environ, ZMYTH_DIR=ROOT+"/run", HOME=ROOT+"/home", SHELL="/bin/bash")
+env.pop("ZMYTH_SESSION", None)
+# Attach via a pty we NEVER read from. Master stays open in THIS process for
+# the duration so the attach client doesn't get HUP-detached.
+m, s = pty.openpty()
+fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+p = subprocess.Popen([ZMYTH, "attach", "hq2"], stdin=s, stdout=s, stderr=s,
+                     env=env, start_new_session=True)
+os.close(s)
+time.sleep(1.0)
+# Generate enough output that the daemon's write backlog to this client crosses
+# leader_demote_backlog (256KiB) but stays under the 4MiB drop limit.
+subprocess.run([ZMYTH, "run", "hq2", "--", "head -c 400000 /dev/zero | tr '\\0' x"],
+               env=env, capture_output=True, timeout=15)
+time.sleep(0.3)
+# Confirm the attach client is still alive (master held open here).
+assert p.poll() is None, "attach client exited early — test setup invalid"
+# Probe: stalled client is "attached" but can't relay; ghostty should answer.
+r = subprocess.run([ZMYTH, "run", "hq2", "--", PROBE],
+                   env=env, capture_output=True, text=True, timeout=10)
+m_ = re.search(r"(GOT_REPLY|NO_REPLY) (\d+)", r.stdout)
+print(m_.group(0) if m_ else "NO_OUTPUT")
+p.kill(); p.wait()
+PY
+)
+echo "  result: ${out}ms"
+case "$out" in
+  GOT_REPLY*) ok "DSR answered despite stalled attach client (${out#GOT_REPLY }ms)" ;;
+  NO_REPLY*)  bad "stalled attach client suppressed ghostty reply" "${out}ms" ;;
+  *)          bad "probe produced no recognizable output" "$out" ;;
+esac
+"$ZMYTH" kill hq2 -9 2>/dev/null
+
 echo
 echo "── headless_query: $PASS passed, $FAIL failed ──"
 [ $FAIL -eq 0 ]

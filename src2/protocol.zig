@@ -20,7 +20,11 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const OSC_START = "\x1b]2718;";
+// We scan for *any* OSC introducer, then dispatch on the body prefix in
+// parsePayload. Unrecognised OSCs (titles, hyperlinks, clipboard, …) are
+// cheap to skip: find terminator, drop. This keeps the boundary-safe scan
+// logic uniform across 2718/7/133 instead of one indexOf per number.
+const OSC_START = "\x1b]";
 const BEL = "\x07";
 const ST = "\x1b\\";
 const BP_ON = "\x1b[?2004h";
@@ -56,6 +60,13 @@ pub const Event = union(enum) {
     probe: struct { shell: Shell, shell_major: u32, hook_v: u32 },
     /// CSI ?2004h (bracketed-paste on) — shell is back at the prompt
     prompt,
+    /// OSC 7 `file://<host>/<path>`: shell-reported cwd. Path component only,
+    /// percent-encoding left intact. Slice valid until next feed().
+    pwd: []const u8,
+    /// OSC 133;D[;<exit_code>]: FinalTerm/iTerm2 "command finished". Emitted
+    /// by starship/oh-my-posh independently of our hook, so it gives degraded
+    /// `run` a real exit code. null when no code argument was present.
+    osc133_end: ?i32,
 };
 
 pub const Scanner = struct {
@@ -157,7 +168,30 @@ pub const Scanner = struct {
         }
     }
 
-    fn parsePayload(self: *Scanner, payload: []const u8, out: *std.ArrayList(Event)) !void {
+    fn parsePayload(self: *Scanner, body: []const u8, out: *std.ArrayList(Event)) !void {
+        // body is everything between `\e]` and the terminator.
+        if (std.mem.startsWith(u8, body, "2718;"))
+            return self.parse2718(body[5..], out);
+        if (std.mem.startsWith(u8, body, "7;"))
+            return self.parsePwd(body[2..], out);
+        if (std.mem.startsWith(u8, body, "133;D"))
+            return out.append(self.gpa, .{ .osc133_end = parse133D(body[5..]) });
+        // Everything else (OSC 0/2/8/52/133;A-C/…) is handled by ghostty's
+        // Terminal directly; nothing to surface here.
+    }
+
+    /// `file://[host]/path` → emit `.pwd = "/path"`. Host ignored. Percent-
+    /// encoding left intact (consumer can decode; we just want a display cwd).
+    fn parsePwd(self: *Scanner, uri: []const u8, out: *std.ArrayList(Event)) !void {
+        const rest = if (std.mem.startsWith(u8, uri, "file://")) uri[7..] else return;
+        const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse return;
+        const path = rest[path_start..];
+        const off = self.cwd_storage.items.len;
+        self.cwd_storage.appendSliceAssumeCapacity(path);
+        try out.append(self.gpa, .{ .pwd = self.cwd_storage.items[off..] });
+    }
+
+    fn parse2718(self: *Scanner, payload: []const u8, out: *std.ArrayList(Event)) !void {
         var it = std.mem.splitScalar(u8, payload, ';');
         const kind = it.next() orelse return;
         if (std.mem.eql(u8, kind, "hello")) {
@@ -225,6 +259,13 @@ fn parseProbe(body: []const u8) @FieldType(Event, "probe") {
         }
     }
     return r;
+}
+
+/// `133;D` body after the `D`: empty, or `;<exit_code>[;aid=...]`.
+fn parse133D(rest: []const u8) ?i32 {
+    if (rest.len < 2 or rest[0] != ';') return null;
+    var it = std.mem.splitScalar(u8, rest[1..], ';');
+    return std.fmt.parseInt(i32, it.first(), 10) catch null;
 }
 
 fn leadingInt(s: []const u8) u32 {
@@ -424,6 +465,42 @@ test "probe: fish" {
     const ev = (try collectOne(&s, "\x1b]2718;probe;b=,z=,f=3.7.0,h=\x07")).?;
     try testing.expectEqual(Shell.fish, ev.probe.shell);
     try testing.expectEqual(@as(u32, 3), ev.probe.shell_major);
+}
+
+test "OSC 7 (pwd) parsed" {
+    var s = Scanner.init(testing.allocator);
+    defer s.deinit();
+    const ev = (try collectOne(&s, "\x1b]7;file://host/home/u/proj\x07")) orelse
+        return error.EventNotEmitted;
+    try testing.expectEqualStrings("/home/u/proj", ev.pwd);
+}
+
+test "OSC 7: hostless and percent-encoded" {
+    var s = Scanner.init(testing.allocator);
+    defer s.deinit();
+    // file:///path (no host) — common from `printf '\e]7;file://%s\a' "$PWD"`
+    const e1 = (try collectOne(&s, "\x1b]7;file:///root\x07")) orelse
+        return error.EventNotEmitted;
+    try testing.expectEqualStrings("/root", e1.pwd);
+    // Percent-encoding is passed through verbatim (consumer decodes if needed).
+    const e2 = (try collectOne(&s, "\x1b]7;file://h/a%20b\x07")) orelse
+        return error.EventNotEmitted;
+    try testing.expectEqualStrings("/a%20b", e2.pwd);
+}
+
+test "OSC 133;D (command end) exit code parsed" {
+    var s = Scanner.init(testing.allocator);
+    defer s.deinit();
+    const ev = (try collectOne(&s, "\x1b]133;D;42\x07")) orelse
+        return error.EventNotEmitted;
+    try testing.expectEqual(@as(?i32, 42), ev.osc133_end);
+    // No exit-code argument → null.
+    const e2 = (try collectOne(&s, "\x1b]133;D\x07")) orelse
+        return error.EventNotEmitted;
+    try testing.expectEqual(@as(?i32, null), e2.osc133_end);
+    // 133;A/B/C are tracked by ghostty's Terminal.semanticPrompt; we only
+    // surface D (the one carrying data ghostty doesn't store).
+    try testing.expectEqual(@as(?Event, null), try collectOne(&s, "\x1b]133;A\x07"));
 }
 
 test "probe: unknown (sh/dash — all version fields empty)" {

@@ -439,6 +439,18 @@ fn runLoop(d: *Daemon) !void {
                 break;
             } else if (n != std.math.maxInt(usize)) {
                 const data = read_buf[0..n];
+                // Recount before each feed: a client whose backlog has crossed
+                // the demote threshold (catatonic terminal) won't relay query
+                // replies, so it doesn't count as "someone who'll answer."
+                d.session.attached_clients = blk: {
+                    var k: u32 = 0;
+                    for (d.clients.items) |*c| if (c.attached and !c.closed and
+                        c.framer.pendingWrite().len <= leader_demote_backlog)
+                    {
+                        k += 1;
+                    };
+                    break :blk k;
+                };
                 try d.session.feedPtyOutput(data);
                 // Broadcast to clients that want live output.
                 for (d.clients.items) |*c| {
@@ -677,7 +689,6 @@ fn reapClosedClients(d: *Daemon) void {
         flushClient(c);
         log.info("client {d} disconnected", .{c.id});
         if (d.leader_id == c.id) d.leader_id = null;
-        if (c.attached) d.session.attached_clients -= 1;
         // Don't execute commands queued by a now-dead client.
         d.session.cancelClientRuns(c.id);
         d.session.cancelClientHook(c.id);
@@ -832,7 +843,6 @@ fn handleAttach(d: *Daemon, c: *Client, payload: []const u8) !void {
     if (payload.len < 4) return queueErr(c, "attach: short payload", .{});
     c.cols = std.mem.readInt(u16, payload[0..2], .little);
     c.rows = std.mem.readInt(u16, payload[2..4], .little);
-    if (!c.attached) d.session.attached_clients += 1;
     c.attached = true;
     c.wants_output = true;
     // The freshest attach is overwhelmingly the terminal a human is looking
