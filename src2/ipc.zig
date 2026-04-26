@@ -14,29 +14,30 @@ const Allocator = std.mem.Allocator;
 const max_frame_len: u32 = 16 * 1024 * 1024;
 
 pub const Tag = enum(u8) {
-    // client -> daemon
-    attach,
-    input,
-    resize,
-    run,
-    send,
-    read,
-    write_hdr,
-    write_data,
-    info,
-    wait,
-    kill,
-    rename,
-    detach,
-    // daemon -> client
-    output,
-    state,
-    run_done,
-    info_reply,
-    data,
-    ack,
-    err,
-    eof,
+    // ── client → daemon ──────────────────────────────────────────────────
+    attach, //     u16 cols, u16 rows, then KEY=VAL\0… env pairs
+    input, //      raw stdin bytes
+    resize, //     u16 cols, u16 rows
+    run, //        u8 interactive (0/1), then command string
+    send, //       raw bytes for PTY
+    read, //       u8 mode (0=scrollback,1=screen,2=follow), u8 fmt, u32 tail_n
+    write_hdr, //  target path string
+    write_data, // chunk of base64; empty = EOF
+    info, //       (empty)
+    wait, //       (empty)
+    kill, //       u8 signal (default SIGTERM)
+    rename, //     new name string
+    detach, //     (empty)
+    hook, //       (empty)
+    // ── daemon → client ──────────────────────────────────────────────────
+    output, //     raw PTY bytes
+    state, //      attach replay (chunked)
+    run_done, //   RunDoneWire
+    info_reply, // JSON
+    data, //       read response (chunked)
+    ack, //        optional message string
+    err, //        message string
+    eof, //        (empty)
     _, // non-exhaustive: unknown tags are returned to the caller, who may skip
 };
 
@@ -65,7 +66,18 @@ pub const RunDoneWire = extern struct {
     _pad: [3]u8 = .{ 0, 0, 0 },
     dur_ms: u64,
 
-    pub const Via = enum(u8) { osc_done, prompt_fallback, pty_eof, line_rejected, _ };
+    pub const Via = enum(u8) {
+        osc_done,
+        prompt_fallback,
+        pty_eof,
+        line_rejected,
+        /// `run -i`: a nested prompt appeared (via ?2004h or a new-pid `done`).
+        at_prompt,
+        /// The layer this run was typed into exited (e.g. ssh dropped) before
+        /// the run's own `done` arrived. exit_code is the parent's `done` ec.
+        layer_exited,
+        _,
+    };
     pub const null_exit: i32 = std.math.minInt(i32);
 
     pub fn exitCode(self: RunDoneWire) ?i32 {
@@ -182,12 +194,7 @@ pub const Framer = struct {
 // uses Framer directly).
 // ---------------------------------------------------------------------------
 
-fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        off += try posix.write(fd, bytes[off..]);
-    }
-}
+const writeAll = @import("io.zig").writeAllFd;
 
 fn readExact(fd: posix.fd_t, buf: []u8) !void {
     var off: usize = 0;

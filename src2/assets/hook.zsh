@@ -1,13 +1,12 @@
-if [[ -z "${__ZMX_HOOKED:-}" ]]; then
-  __ZMX_HOOKED=1
+if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
+  typeset -g __ZMYTH_HOOK_V=1
   zmodload zsh/datetime 2>/dev/null
-  typeset -g __ZMX_NONCE='__ZMX_NONCE__'
   typeset -g __ZMX_RAN=0
   typeset -g __ZMX_T0=
   __zmx_preexec() {
     __ZMX_RAN=1
     __ZMX_T0=${EPOCHREALTIME:-}
-    printf '\033]2718;preexec;%s\007' "$__ZMX_NONCE"
+    printf '\033]2718;preexec;%s\007' "$$"
   }
   __zmx_precmd() {
     local __zmx_ec=$?
@@ -20,7 +19,7 @@ if [[ -z "${__ZMX_HOOKED:-}" ]]; then
     fi
     __ZMX_RAN=0
     __ZMX_T0=
-    printf '\033]2718;done;%s;%d;%d;%s\007' "$__ZMX_NONCE" "$__zmx_ec" "$dur" "$PWD"
+    printf '\033]2718;done;%s;%d;%d;%s\007' "$$" "$__zmx_ec" "$dur" "$PWD"
   }
   autoload -Uz add-zsh-hook 2>/dev/null
   if typeset -f add-zsh-hook >/dev/null; then

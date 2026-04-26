@@ -16,14 +16,9 @@ extern "c" fn ptsname(fd: c_int) ?[*:0]const u8;
 
 // ---- ioctl request numbers -----------------------------------------------
 
-// std exposes these for Linux via std.posix.system.T, but the macOS set is
-// incomplete (only IOCGWINSZ). Define the full set ourselves so the same
-// code path works on both targets.
-const TIOCGWINSZ: c_ulong = switch (builtin.os.tag) {
-    .linux => std.os.linux.T.IOCGWINSZ,
-    .macos => 0x40087468,
-    else => @compileError("unsupported OS"),
-};
+// std.posix.system.T has IOCGWINSZ on every target; the *set* variants are
+// missing on macOS as of 0.15.2, so define those ourselves.
+const TIOCGWINSZ: c_ulong = std.posix.system.T.IOCGWINSZ;
 const TIOCSWINSZ: c_ulong = switch (builtin.os.tag) {
     .linux => std.os.linux.T.IOCSWINSZ,
     .macos => 0x80087467,

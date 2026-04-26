@@ -304,6 +304,46 @@ def main():
         subprocess.run([ZMX, "kill", "-9", "mc"], env=env, capture_output=True)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Scenario A2: second attach steals leader → PTY resizes to new client.
+    # Repro for the "stale orphan holds leader at wrong width" Ink-corruption
+    # bug: A is the orphan (211 cols, never types again), B is the user's fresh
+    # attach (119 cols). PTY must be at B's size before B types anything.
+    # ─────────────────────────────────────────────────────────────────────────
+    try:
+        A = Attach(env, "ldr", rows=31, cols=211); spawned.append(A)
+        wait_ready(A, fresh=True)
+        # Confirm A's size took.
+        A.write(b"echo SZA-$(stty size | tr ' ' x)\r")
+        check("leader-steal: first attach sets PTY 31x211",
+              A.read_until(b"SZA-31x211", timeout=3.0),
+              extra=repr(bytes(A.buf[-120:])))
+
+        # B attaches at a DIFFERENT, smaller size and never types. PTY should
+        # immediately resize to B's size (B is the freshest attach). Query via
+        # `zmx run` so neither attach client sends .input (which would itself
+        # re-promote and mask the result).
+        B = Attach(env, "ldr", rows=31, cols=119); spawned.append(B)
+        B.pump(0.6)
+        r = subprocess.run([ZMX, "run", "ldr", "--", "stty size | tr ' ' x"],
+                           env=env, capture_output=True, text=True, timeout=10)
+        check("leader-steal: second attach resizes PTY to its 31x119 (no input)",
+              "31x119" in r.stdout, extra=repr(r.stdout[-150:]))
+
+        # A types (real user input) → A re-promotes → PTY back to 211.
+        A.buf.clear()
+        A.write(b"echo SZC-$(stty size | tr ' ' x)\r")
+        check("leader-steal: input from A re-promotes (PTY back to 211)",
+              A.read_until(b"SZC-31x211", timeout=3.0),
+              extra=repr(bytes(A.buf[-150:])))
+
+        for c in (A, B):
+            c.write(b"\x1c"); c.wait_exit(timeout=3.0); c.close()
+    except Exception as e:
+        bad(f"leader-steal: scenario crashed: {e!r}")
+    finally:
+        subprocess.run([ZMX, "kill", "-9", "ldr"], env=env, capture_output=True)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Scenario B: daemon SIGKILL while attached → clean exit + termios restored
     # ─────────────────────────────────────────────────────────────────────────
     try:

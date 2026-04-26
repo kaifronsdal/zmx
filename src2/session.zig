@@ -9,6 +9,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const vt = @import("ghostty-vt");
 const protocol = @import("protocol.zig");
+const shell = @import("shell.zig");
 
 /// Floor for the line-acceptance window: nanoseconds the daemon waits, after
 /// typing a `run` command, for any acceptance signal (preexec/done/prompt).
@@ -24,6 +25,40 @@ const ACCEPT_TIMEOUT_NS: i128 = 1000 * std.time.ns_per_ms;
 
 /// `ReadonlyStream` is not re-exported from lib_vt; derive it.
 const VtStream = @TypeOf(@as(*vt.Terminal, undefined).vtStream());
+const VtHandler = VtStream.Handler;
+// `device_attributes.Attributes` isn't re-exported from lib_vt; derive it from
+// the callback's return type (`?*const fn(*Handler) Attributes`).
+const VtAttrs = @typeInfo(@typeInfo(
+    @typeInfo(@FieldType(VtHandler.Effects, "device_attributes")).optional.child,
+).pointer.child).@"fn".return_type.?;
+
+// The handler→stream→session `@fieldParentPtr` chain below is sound only
+// while ghostty's `Stream` holds its handler by value. Guard at comptime so
+// a future ghostty change to `*Handler` fails loudly here, not as UB.
+comptime {
+    assert(@FieldType(VtStream, "handler") == VtHandler);
+}
+
+/// `Effects.write_pty`: ghostty has computed a response to a terminal query
+/// (DSR `\e[6n`, DECRQM, DA, …) the inner app emitted. With no attach client
+/// the app would otherwise wait on its query timeout, since nothing else can
+/// answer; queue ghostty's response to its stdin. With a client attached, the
+/// real terminal answers via passthrough — stay silent so the app doesn't see
+/// two replies.
+fn vtWritePty(h: *VtHandler, data: [:0]const u8) void {
+    const stream: *VtStream = @alignCast(@fieldParentPtr("handler", h));
+    const sess: *Session = @alignCast(@fieldParentPtr("stream", stream));
+    if (sess.attached_clients > 0) return;
+    // OOM: drop the reply; the app will time out as it would have anyway.
+    sess.pty_input.appendSlice(sess.gpa, data) catch return;
+}
+
+/// `Effects.device_attributes`: what to report for DA1/2/3. Default = VT220
+/// with ANSI colour — conservative enough that apps won't try features the
+/// eventual real terminal might lack.
+fn vtDeviceAttrs(_: *VtHandler) VtAttrs {
+    return .{};
+}
 
 const RunCompletion = struct {
     /// null when no exit code is knowable (prompt-fallback / line-rejected).
@@ -43,6 +78,9 @@ const RunRequest = struct {
     cmd: []u8,
     /// Opaque; daemon maps it back to a socket.
     client_id: u32,
+    /// `run -i`: complete on the first nested-prompt signal (new-pid `done`
+    /// or post-preexec `?2004h`) instead of waiting for this layer's `done`.
+    interactive: bool,
     /// nanoTimestamp when queued (for the prompt-wait timeout).
     queued_ns: i128,
     /// Bytes queued into pty_input?
@@ -51,12 +89,49 @@ const RunRequest = struct {
     accepted: bool = false,
     /// 5s prompt-wait warning already sent to this client?
     warned: bool = false,
+    /// `layers.len - 1` at type time: which layer this was typed into.
+    layer_depth: u8 = 0,
+    /// Captured at type time: was that layer hooked? (i.e., is a preexec
+    /// expected, so absence-of-preexec means continuation prompt → ^C.)
+    expect_preexec: bool = false,
     /// nanoTimestamp when typed.
     started_ns: i128 = 0,
     /// nanoTimestamp when pty_input drained to empty after typing (i.e. the
     /// bytes have actually hit the PTY). 0 = not yet. Acceptance timeout is
     /// measured from here, not started_ns.
     flushed_ns: i128 = 0,
+};
+
+/// One nested shell. `layers[0]` is the locally-spawned shell; deeper indices
+/// are nested (ssh, docker exec, su, plain `bash`). Only the top layer can be
+/// at a prompt — every layer below is, by construction, running whatever
+/// spawned the next layer up.
+const Layer = struct {
+    /// 0 = unknown (degraded layer pushed by `run -i` on bare ?2004h).
+    pid: i32,
+    shell: protocol.Shell = .unknown,
+    /// This layer's hook is installed and emitting `done` OSCs.
+    hooked: bool = false,
+    /// preexec seen, done not yet. Meaningful only for the top layer.
+    cmd_running: bool = false,
+    /// Daemon-typed inject(s) for this layer whose echo `done` is still owed.
+    inject_pending: u8 = 0,
+};
+
+/// Nesting deeper than this is treated as a single layer (top is replaced
+/// rather than pushed). 8 is already absurd for interactive use.
+const max_layers = 8;
+
+/// Fixed-capacity stack (std.BoundedArray was removed in Zig 0.15).
+const Layers = struct {
+    buffer: [max_layers]Layer = undefined,
+    len: u8 = 0,
+    fn push(self: *Layers, l: Layer) *Layer {
+        if (self.len == max_layers) self.len -= 1; // overflow: replace top
+        self.buffer[self.len] = l;
+        self.len += 1;
+        return &self.buffer[self.len - 1];
+    }
 };
 
 pub const PromptWait = union(enum) {
@@ -69,6 +144,35 @@ pub const PromptWait = union(enum) {
     timeout: u32, // client_id
 };
 
+/// In-flight `zmyth hook` install.
+const HookPending = struct {
+    client_id: u32,
+    phase: enum { probing, installing },
+    deadline_ns: i128,
+    /// Count of preexec/done events to swallow before the install's own
+    /// `done` is the one we're waiting for. When the probe runs in an
+    /// already-hooked outer shell, that shell's preexec/done bracket it;
+    /// when not hooked (the nested case), nothing brackets it.
+    echo_swallow: u8 = 0,
+    /// Shell detected by the probe; reported back on `.installed` (the new
+    /// layer's `done` doesn't carry shell, only pid).
+    shell: protocol.Shell = .unknown,
+};
+
+pub const HookResult = union(enum) {
+    /// Hook was already active in the target shell at this version.
+    already_hooked: u32,
+    /// Install completed; this is the shell that was hooked.
+    installed: protocol.Shell,
+    /// Static error string for the client.
+    err: []const u8,
+};
+
+pub const HookCompletion = struct {
+    client_id: u32,
+    result: HookResult,
+};
+
 pub const Session = struct {
     gpa: std.mem.Allocator,
     term: vt.Terminal,
@@ -77,27 +181,15 @@ pub const Session = struct {
     /// at the top of every method that touches the stream.
     stream: VtStream,
     scanner: protocol.Scanner,
-    nonce: [16]u8,
 
-    // Shell-integration state — orthogonal flags, not an FSM.
-    shell: protocol.Shell = .unknown,
+    /// Nested-shell stack. Empty until the first `hello`/`done`/`?2004h`.
+    layers: Layers = .{},
+
     /// A `hello` arrived naming a shell we can't hook (e.g. bash <4 announces
     /// as `bash-pre4`). `run` should fail fast rather than wait 30s.
     unhookable: bool = false,
-    /// First `done` OSC seen → hook is installed and emitting.
-    hooked: bool = false,
-    /// nanoTimestamp when `hooked` flipped false→true. checkAcceptanceTimeout
-    /// only applies to requests typed at-or-after this point, so a command
-    /// typed in degraded mode isn't ^C'd when a nested shell later hooks.
-    hooked_since_ns: i128 = 0,
     /// At least one `?2004h` seen → degraded "back at prompt" detection works.
     seen_prompt: bool = false,
-    /// Count of hook injections whose preexec/done echo we're still waiting to
-    /// swallow. Usually 0 or 1, but a nested shell can `hello` before the
-    /// outer inject's `done` arrives, so this must be a counter, not a bool.
-    inject_echo_pending: u8 = 0,
-    /// preexec seen, done not yet.
-    cmd_running: bool = false,
     /// Observed flush→preexec latency for the most recent accepted request.
     /// Scales the acceptance-timeout window so a nested hook over a slow SSH
     /// link isn't ^C'd just because the OSC took a network RTT to arrive.
@@ -105,6 +197,16 @@ pub const Session = struct {
     last_exit: ?i32 = null,
     last_cwd: [std.fs.max_path_bytes]u8 = undefined,
     last_cwd_len: usize = 0,
+
+    /// Number of `.attach`ed clients (maintained by daemon on accept/reap).
+    /// When zero, ghostty's shadow terminal answers DSR/DA/etc. queries on
+    /// the app's behalf; when nonzero, the real terminal answers via
+    /// passthrough and ghostty stays silent to avoid double replies.
+    attached_clients: u32 = 0,
+
+    /// In-flight `zmyth hook` install (probe → install → wait for done).
+    hook_pending: ?HookPending = null,
+    hook_completed: ?HookCompletion = null,
 
     // I/O queues — daemon drains/fills these.
     /// Bytes to write to PTY master.
@@ -115,9 +217,6 @@ pub const Session = struct {
     events: std.ArrayList(protocol.Event),
 
     pub fn init(allocator: std.mem.Allocator, rows: u16, cols: u16) !Session {
-        var nonce: [16]u8 = undefined;
-        _ = protocol.genNonce(&nonce);
-
         var term = try vt.Terminal.init(allocator, .{
             .cols = @max(1, cols),
             .rows = @max(1, rows),
@@ -129,8 +228,7 @@ pub const Session = struct {
             .term = term,
             // Handler pointer is patched at the top of feedPtyOutput().
             .stream = VtStream.initAlloc(allocator, .{ .terminal = undefined }),
-            .scanner = try protocol.Scanner.init(allocator, &nonce),
-            .nonce = nonce,
+            .scanner = protocol.Scanner.init(allocator),
             .pty_input = .empty,
             .run_queue = .empty,
             .completed = .empty,
@@ -156,71 +254,25 @@ pub const Session = struct {
     /// when not hooked. May queue bytes into pty_input (hook injection, next
     /// queued command) and append to completions.
     pub fn feedPtyOutput(self: *Session, bytes: []const u8) !void {
-        // See doc on the `stream` field.
+        // `.terminal` must be patched here (self-referential; Session is
+        // returned by value from init). The effects pointers are not
+        // self-referential and could go in init(), but Effects has no
+        // per-field defaults so naming every callback there is noisier than
+        // two stores here.
         self.stream.handler.terminal = &self.term;
+        self.stream.handler.effects.write_pty = &vtWritePty;
+        self.stream.handler.effects.device_attributes = &vtDeviceAttrs;
         self.stream.nextSlice(bytes);
 
         self.events.clearRetainingCapacity();
         try self.scanner.feed(bytes, &self.events);
 
         for (self.events.items) |ev| switch (ev) {
-            .hello => |sh| {
-                self.shell = sh;
-                if (sh == .unknown) {
-                    self.unhookable = true;
-                    continue;
-                }
-                self.unhookable = false;
-                const inj = try protocol.buildInject(self.gpa, sh, &self.nonce);
-                defer self.gpa.free(inj);
-                try self.pty_input.appendSlice(self.gpa, inj);
-                self.inject_echo_pending +|= 1;
-            },
-            .preexec => {
-                self.cmd_running = true;
-                if (self.inject_echo_pending > 0) continue;
-                if (self.front()) |r| if (r.sent) {
-                    if (r.flushed_ns != 0) {
-                        self.last_preexec_latency_ns =
-                            std.time.nanoTimestamp() - r.flushed_ns;
-                    }
-                    r.accepted = true;
-                };
-            },
-            .done => |d| {
-                if (!self.hooked) self.hooked_since_ns = std.time.nanoTimestamp();
-                self.hooked = true;
-                self.cmd_running = false;
-                self.last_exit = d.exit_code;
-                const n = @min(d.cwd.len, self.last_cwd.len);
-                @memcpy(self.last_cwd[0..n], d.cwd[0..n]);
-                self.last_cwd_len = n;
-
-                if (self.inject_echo_pending > 0) {
-                    self.inject_echo_pending -= 1;
-                    continue;
-                }
-                if (self.front()) |r| if (r.sent) {
-                    const req = self.popFront();
-                    try self.complete(req, .{
-                        .exit_code = d.exit_code,
-                        .via = .osc_done,
-                        .dur_ms = d.dur_ms,
-                    });
-                };
-            },
-            .prompt => {
-                self.seen_prompt = true;
-                if (self.hooked or self.inject_echo_pending > 0) continue;
-                if (self.front()) |r| if (r.sent) {
-                    const req = self.popFront();
-                    try self.complete(req, .{
-                        .exit_code = null,
-                        .via = .prompt_fallback,
-                        .dur_ms = msSince(req.started_ns, std.time.nanoTimestamp()),
-                    });
-                };
-            },
+            .hello => |h| try self.onHello(h.shell, h.pid),
+            .probe => |p| try self.onProbe(p),
+            .preexec => |pid| self.onPreexec(pid),
+            .done => |d| try self.onDone(d.pid, d.exit_code, d.dur_ms, d.cwd),
+            .prompt => try self.onPrompt(),
         };
 
         // Type the next queued request only after all events from this chunk
@@ -229,17 +281,260 @@ pub const Session = struct {
         try self.tryTypeNext();
     }
 
-    /// Queue a `zmx run` request. If the shell is idle, types it immediately;
-    /// otherwise it waits for the next done/prompt.
-    pub fn queueRun(self: *Session, client_id: u32, cmd: []const u8) !void {
+    /// Queue a `zmx run` request. If the top layer is idle, types it
+    /// immediately; otherwise it waits for the next done/prompt.
+    pub fn queueRun(self: *Session, client_id: u32, cmd: []const u8, interactive: bool) !void {
         const owned = try self.gpa.dupe(u8, cmd);
         errdefer self.gpa.free(owned);
         try self.run_queue.append(self.gpa, .{
             .cmd = owned,
             .client_id = client_id,
+            .interactive = interactive,
             .queued_ns = std.time.nanoTimestamp(),
         });
         try self.tryTypeNext();
+    }
+
+    // ───────────────────── layer stack + event handlers ─────────────────────
+
+    /// Active (top) layer, or null before any signal has arrived.
+    fn top(self: *Session) ?*Layer {
+        const n = self.layers.len;
+        return if (n == 0) null else &self.layers.buffer[n - 1];
+    }
+
+    fn topDepth(self: *const Session) u8 {
+        return if (self.layers.len == 0) 0 else @intCast(self.layers.len - 1);
+    }
+
+    /// Index of `pid` in the stack, or null. pid==0 (degraded) only matches
+    /// the top — we can't tell degraded layers apart.
+    fn findLayer(self: *const Session, pid: i32) ?u8 {
+        if (pid == 0) {
+            return if (self.layers.len > 0 and self.layers.buffer[self.layers.len - 1].pid == 0)
+                self.layers.len - 1
+            else
+                null;
+        }
+        var i: u8 = self.layers.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.layers.buffer[i].pid == pid) return i;
+        }
+        return null;
+    }
+
+    fn pushLayer(self: *Session, l: Layer) *Layer {
+        // Degraded-top promotion: if the current top is a pid==0 placeholder
+        // (pushed by `run -i` on bare ?2004h) and a real pid now announces,
+        // adopt it instead of stacking on top of a ghost.
+        if (self.top()) |t| if (t.pid == 0 and l.pid != 0) {
+            t.* = l;
+            return t;
+        };
+        return self.layers.push(l);
+    }
+
+    /// Pop layers above `depth`, completing any sent run at a popped depth as
+    /// `.layer_exited` (its shell vanished before emitting `done`).
+    fn popLayersAbove(self: *Session, depth: u8, ec: i32) !void {
+        while (self.layers.len > depth + 1) {
+            const gone: u8 = @intCast(self.layers.len - 1);
+            self.layers.len -= 1;
+            var i: usize = 0;
+            while (i < self.run_queue.items.len) {
+                const r = &self.run_queue.items[i];
+                if (r.sent and r.layer_depth == gone) {
+                    const req = self.run_queue.orderedRemove(i);
+                    try self.complete(req, .{
+                        .exit_code = ec,
+                        .via = .layer_exited,
+                        .dur_ms = msSince(req.started_ns, std.time.nanoTimestamp()),
+                    });
+                } else i += 1;
+            }
+        }
+    }
+
+    fn onHello(self: *Session, sh: protocol.Shell, pid: i32) !void {
+        if (sh == .unknown) {
+            // Spawn rc-shim says this shell can't be hooked (bash <4 etc.).
+            // Track it as a degraded layer so canType has somewhere to look.
+            _ = self.pushLayer(.{ .pid = pid, .shell = .unknown });
+            self.unhookable = true;
+            return;
+        }
+        self.unhookable = false;
+        const layer = if (self.findLayer(pid)) |i| &self.layers.buffer[i] //
+            else self.pushLayer(.{ .pid = pid });
+        layer.shell = sh;
+        // Type the hook inject; its first `done` is owed back to this layer.
+        const inj = try shell.buildInject(self.gpa, sh);
+        defer self.gpa.free(inj);
+        try self.pty_input.appendSlice(self.gpa, inj);
+        layer.inject_pending +|= 1;
+    }
+
+    fn onPreexec(self: *Session, pid: i32) void {
+        const depth: u8 = self.findLayer(pid) orelse blk: {
+            _ = self.pushLayer(.{ .pid = pid, .hooked = true });
+            break :blk self.topDepth();
+        };
+        const layer = &self.layers.buffer[depth];
+        layer.cmd_running = true;
+        if (self.hook_pending) |*hp| {
+            hp.echo_swallow +|= 1;
+            return;
+        }
+        if (layer.inject_pending > 0) return;
+        if (self.sentAt(depth)) |r| {
+            if (r.flushed_ns != 0) {
+                self.last_preexec_latency_ns = std.time.nanoTimestamp() - r.flushed_ns;
+            }
+            r.accepted = true;
+        }
+    }
+
+    fn onDone(self: *Session, pid: i32, ec: i32, dur_ms: u64, cwd: []const u8) !void {
+        self.last_exit = ec;
+        const n = @min(cwd.len, self.last_cwd.len);
+        @memcpy(self.last_cwd[0..n], cwd[0..n]);
+        self.last_cwd_len = n;
+
+        // Route by pid: known layer below top → that layer's child chain has
+        // exited; pop down. Unknown pid → a freshly-hooked nested shell (file-
+        // installed hook reaching its first prompt); push it.
+        const found = self.findLayer(pid);
+        const is_new = found == null;
+        const depth: u8 = if (found) |i| blk: {
+            try self.popLayersAbove(i, ec);
+            break :blk i;
+        } else blk: {
+            _ = self.pushLayer(.{ .pid = pid, .hooked = true });
+            break :blk self.topDepth();
+        };
+
+        const layer = &self.layers.buffer[depth];
+        layer.hooked = true;
+        layer.cmd_running = false;
+
+        if (self.hook_pending) |*hp| {
+            if (hp.echo_swallow > 0) {
+                hp.echo_swallow -= 1;
+                return;
+            }
+            // The freshly-hooked layer's first `done` has no paired preexec
+            // (the hook arms preexec only after the first prompt), so it
+            // arrives here with echo_swallow==0. This holds whether the
+            // layer is a new pid (ssh, subshell) or the same pid (`exec
+            // bash`). The one false positive — an outer layer's `done`
+            // landing in the <1s install window (e.g. ssh dropping mid-
+            // install) — is rare and benign: the file was written, only the
+            // "installed" message is optimistic.
+            if (hp.phase == .installing) {
+                if (layer.shell == .unknown) layer.shell = hp.shell;
+                self.completeHook(.{ .installed = layer.shell });
+                return;
+            }
+            // .probing: let normal routing handle it.
+        }
+        if (layer.inject_pending > 0) {
+            layer.inject_pending -= 1;
+            return;
+        }
+        // A NEW layer's first `done` is its first-prompt precmd, not a command
+        // completion. It may complete a pending `run -i` one level down.
+        if (is_new) {
+            if (depth > 0) if (self.sentAt(depth - 1)) |r| if (r.interactive and r.accepted) {
+                const req = self.removeReq(r);
+                try self.complete(req, .{ .exit_code = 0, .via = .at_prompt, .dur_ms = dur_ms });
+            };
+            return;
+        }
+        if (self.sentAt(depth)) |r| {
+            const req = self.removeReq(r);
+            try self.complete(req, .{ .exit_code = ec, .via = .osc_done, .dur_ms = dur_ms });
+        }
+    }
+
+    fn onPrompt(self: *Session) !void {
+        self.seen_prompt = true;
+        // First prompt-ready signal ever: establish a degraded base layer.
+        if (self.layers.len == 0) {
+            _ = self.pushLayer(.{ .pid = 0 });
+        }
+        const t = self.top().?;
+        if (t.inject_pending > 0) return;
+
+        const depth = self.topDepth();
+        if (self.sentAt(depth)) |r| {
+            // `run -i`: a prompt appeared after preexec → nested line editor.
+            // Push a degraded placeholder for it and complete the request.
+            if (r.interactive and r.accepted) {
+                const req = self.removeReq(r);
+                _ = self.pushLayer(.{ .pid = 0 });
+                try self.complete(req, .{
+                    .exit_code = 0,
+                    .via = .at_prompt,
+                    .dur_ms = msSince(req.started_ns, std.time.nanoTimestamp()),
+                });
+                return;
+            }
+            // Unhooked top: ?2004h is the only "back at prompt" signal.
+            if (!t.hooked) {
+                const req = self.removeReq(r);
+                try self.complete(req, .{
+                    .exit_code = null,
+                    .via = .prompt_fallback,
+                    .dur_ms = msSince(req.started_ns, std.time.nanoTimestamp()),
+                });
+            }
+        }
+    }
+
+    /// First sent-but-not-completed request typed at `depth`.
+    fn sentAt(self: *Session, depth: u8) ?*RunRequest {
+        for (self.run_queue.items) |*r| {
+            if (r.sent and r.layer_depth == depth) return r;
+        }
+        return null;
+    }
+
+    fn removeReq(self: *Session, r: *RunRequest) RunRequest {
+        const idx = (@intFromPtr(r) - @intFromPtr(self.run_queue.items.ptr)) / @sizeOf(RunRequest);
+        return self.run_queue.orderedRemove(idx);
+    }
+
+    // ───────────────────── top-layer accessors (for daemon.zig) ─────────────
+
+    pub fn topShell(self: *Session) protocol.Shell {
+        // Prefer the deepest layer that knows its shell (a degraded top hides
+        // the hooked layer beneath it otherwise).
+        var i: usize = self.layers.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.layers.buffer[i].shell != .unknown) return self.layers.buffer[i].shell;
+        }
+        return .unknown;
+    }
+    pub fn topHooked(self: *Session) bool {
+        return if (self.top()) |t| t.hooked else false;
+    }
+    pub fn topCmdRunning(self: *Session) bool {
+        return if (self.top()) |t| t.cmd_running else false;
+    }
+
+    /// Drop the in-flight hook install if `client_id` owns it. The probe (and
+    /// possibly install) bytes already typed can't be recalled, but clearing
+    /// the pending state lets a new `.hook` proceed without waiting out the
+    /// timeout, and stops the orphaned completion from being routed nowhere.
+    pub fn cancelClientHook(self: *Session, client_id: u32) void {
+        if (self.hook_pending) |hp| if (hp.client_id == client_id) {
+            self.hook_pending = null;
+        };
+        if (self.hook_completed) |hc| if (hc.client_id == client_id) {
+            self.hook_completed = null;
+        };
     }
 
     /// Drop any not-yet-typed run requests from `client_id`. Requests already
@@ -281,10 +576,12 @@ pub const Session = struct {
         std.mem.copyForwards(u8, self.pty_input.items[0..rem], self.pty_input.items[n..]);
         self.pty_input.shrinkRetainingCapacity(rem);
         // The acceptance-timeout window opens once the typed bytes have
-        // actually reached the PTY.
+        // actually reached the PTY. Any sent-but-unflushed request qualifies
+        // (with layers there can be at most one — only top accepts typing).
         if (rem == 0) {
-            if (self.front()) |r| if (r.sent and r.flushed_ns == 0) {
-                r.flushed_ns = std.time.nanoTimestamp();
+            const now = std.time.nanoTimestamp();
+            for (self.run_queue.items) |*r| if (r.sent and r.flushed_ns == 0) {
+                r.flushed_ns = now;
             };
         }
     }
@@ -310,7 +607,7 @@ pub const Session = struct {
             -1;
         const now = std.time.nanoTimestamp();
         while (self.run_queue.items.len > 0) {
-            const req = self.popFront();
+            const req = self.run_queue.orderedRemove(0);
             self.complete(req, .{
                 .exit_code = if (req.sent) ec else null,
                 .via = .pty_eof,
@@ -324,15 +621,12 @@ pub const Session = struct {
     /// arrived, send ^C and complete with `.line_rejected`. Returns true if
     /// action was taken.
     pub fn checkAcceptanceTimeout(self: *Session, now_ns: i128) bool {
-        // No preexec signal exists in degraded mode; can't distinguish
-        // "running" from "continuation" so don't ^C real commands.
-        if (!self.hooked) return false;
-        const r = self.front() orelse return false;
-        if (!r.sent or r.accepted) return false;
-        // Typed before the hook went live (degraded path) → no preexec was
-        // ever expected for this request, so absence of acceptance is not a
-        // continuation-prompt signal. Don't ^C it.
-        if (r.started_ns < self.hooked_since_ns) return false;
+        // Only the top-layer request can be awaiting acceptance.
+        const r = self.sentAt(self.topDepth()) orelse return false;
+        if (r.accepted) return false;
+        // No preexec signal exists when typed into a degraded layer; can't
+        // distinguish "running" from "continuation" so don't ^C real commands.
+        if (!r.expect_preexec) return false;
         if (r.flushed_ns == 0) return false;
         // Adaptive window: 3x the last observed flush→preexec round-trip,
         // floored at ACCEPT_TIMEOUT_NS. First command after hooking uses the
@@ -342,7 +636,7 @@ pub const Session = struct {
 
         // Shell is at a continuation prompt (unclosed quote, etc.). Abort.
         self.pty_input.append(self.gpa, 0x03) catch {};
-        const req = self.popFront();
+        const req = self.removeReq(r);
         self.complete(req, .{
             .exit_code = null,
             .via = .line_rejected,
@@ -359,40 +653,30 @@ pub const Session = struct {
     /// send an `.err` to the returned client_id. On `.timeout` the request has
     /// already been completed with `.prompt_fallback`/null.
     pub fn checkPromptWait(self: *Session, now_ns: i128) PromptWait {
-        // Wedge recovery: a nested inject was queued but its `done` never
-        // arrived (shell died, hook failed). canType() is stuck false and the
-        // `hooked` gate below would suppress the normal timeout. Force-clear
-        // after 5s so the queue can drain.
-        if (self.hooked and self.inject_echo_pending > 0) {
-            if (self.front()) |r| if (!r.sent and now_ns - r.queued_ns >= 5 * std.time.ns_per_s) {
-                std.log.warn(
-                    "inject echo never completed ({d} pending); forcing clear",
-                    .{self.inject_echo_pending},
-                );
-                self.inject_echo_pending = 0;
-                self.tryTypeNext() catch {};
-                return .{ .warn = r.client_id };
-            };
-        }
-        // First not-yet-typed request. Not necessarily front(): when hooked,
-        // front may be a long-running command (e.g. `ssh remote`) with a
-        // second request queued behind it — that second client deserves a
-        // "still waiting" notice rather than silence.
-        const r: *RunRequest = for (self.run_queue.items) |*rq| {
-            if (!rq.sent) break rq;
-        } else return .none;
+        const r = self.firstUnsent() orelse return .none;
         const waited = now_ns - r.queued_ns;
 
-        // Hard timeout only applies before the shell has ever signalled
-        // readiness. Once hooked/seen_prompt, an unsent request is queued
-        // behind a running command which may legitimately take hours — never
-        // fail it, just warn below. If the shell has explicitly announced as
-        // unhookable (e.g. bash <4), fail immediately rather than wait 30s.
-        if (!self.hooked and !self.seen_prompt and
-            (self.unhookable or waited >= 30 * std.time.ns_per_s))
-        {
-            // Nothing can be sent before readiness, so r is front().
-            const req = self.popFront();
+        // Wedge recovery: an inject was queued for the top layer but its
+        // `done` never arrived (shell died, hook failed). canType() is stuck
+        // false. Force-clear after 5s so the queue can drain.
+        if (self.top()) |t| if (t.inject_pending > 0 and waited >= 5 * std.time.ns_per_s) {
+            std.log.warn(
+                "inject echo never completed (layer pid={d}, {d} pending); forcing clear",
+                .{ t.pid, t.inject_pending },
+            );
+            t.inject_pending = 0;
+            self.tryTypeNext() catch {};
+            return .{ .warn = r.client_id };
+        };
+
+        // Hard timeout only applies before the top layer has signalled
+        // readiness (hooked or ?2004h). Once ready, an unsent request is
+        // queued behind a running command which may legitimately take hours —
+        // never fail it, just warn. If the shell announced as unhookable
+        // (bash<4, dash), fail immediately rather than wait 30s.
+        const ready = if (self.top()) |t| (t.hooked or self.seen_prompt) else false;
+        if (!ready and (self.unhookable or waited >= 30 * std.time.ns_per_s)) {
+            const req = self.removeReq(r);
             const cid = req.client_id;
             self.complete(req, .{
                 .exit_code = null,
@@ -412,11 +696,56 @@ pub const Session = struct {
         return self.term.screens.active_key == .alternate;
     }
 
-    /// A typed run is awaiting its acceptance signal (preexec). Only the
-    /// front request can be in this state.
-    pub fn pendingAcceptance(self: *Session) bool {
-        const r = self.front() orelse return false;
-        return r.sent and !r.accepted;
+    /// Any mouse-tracking mode is active. A weaker "TUI running" signal than
+    /// alt-screen (some prompt frameworks enable click-to-position at the
+    /// prompt), so exposed in `ls -j` for visibility but not used as a gate.
+    pub fn mouseTracking(self: *Session) bool {
+        const m = &self.term.modes;
+        return m.get(.mouse_event_x10) or m.get(.mouse_event_normal) or
+            m.get(.mouse_event_button) or m.get(.mouse_event_any);
+    }
+
+    /// OSC 0/2 window title — already populated by `vtStream()`. Most shells
+    /// set this from `$PROMPT_COMMAND`/`precmd`; TUIs set it explicitly.
+    pub fn title(self: *const Session) ?[]const u8 {
+        return self.term.getTitle();
+    }
+
+    /// At least one OSC 133 (FinalTerm/iTerm2 shell-integration) sequence has
+    /// been seen. starship/oh-my-posh emit these; useful as a passive
+    /// "shell has *some* integration" flag in unhooked sessions.
+    //
+    // ghostty's handler also surfaces OSC 133;D's exit code and OSC 7's cwd
+    // via `Stream.Action.{semantic_prompt,report_pwd}` — but only transiently
+    // to a custom handler, not to `Terminal` state. A wrapper handler could
+    // let degraded `run` report real exit codes and `ls -j` show cwd in
+    // unhooked sessions. Deferred (separate from `vtWritePty`: those are
+    // app→host notifications, not query replies).
+    pub fn osc133Seen(self: *const Session) bool {
+        // Primary screen, not active: OSC 133 is a shell-prompt thing and
+        // the shell lives on the primary screen.
+        return if (self.term.screens.get(.primary)) |s| s.semantic_prompt.seen else false;
+    }
+
+    /// Some typed run is awaiting its acceptance signal (preexec).
+    fn pendingAcceptance(self: *Session) bool {
+        for (self.run_queue.items) |*r| if (r.sent and !r.accepted) return true;
+        return false;
+    }
+
+    /// No command running on the top layer and nothing queued — a `wait` can
+    /// be answered now.
+    pub fn isIdle(self: *Session) bool {
+        return !self.topCmdRunning() and self.run_queue.items.len == 0;
+    }
+
+    /// Poll loop should use a short timeout instead of blocking: a typed run
+    /// is awaiting `preexec` (acceptance window), an untyped one is waiting
+    /// for the first prompt (5s/30s warn/fail), or a hook install is pending.
+    pub fn needsTimeoutWake(self: *Session) bool {
+        if (self.hook_pending != null) return true;
+        for (self.run_queue.items) |r| if (!r.sent or !r.accepted) return true;
+        return false;
     }
 
     pub fn resize(self: *Session, rows: u16, cols: u16) !void {
@@ -432,18 +761,87 @@ pub const Session = struct {
         return self.last_cwd[0..self.last_cwd_len];
     }
 
-    // ───────────────────────── internals ─────────────────────────
+    // ───────────────────────── hook install ─────────────────────────
 
-    fn front(self: *Session) ?*RunRequest {
-        if (self.run_queue.items.len == 0) return null;
-        return &self.run_queue.items[0];
+    /// Begin a `zmyth hook` install: queue the probe line and arm the state
+    /// machine. Returns a static error string if the session can't accept a
+    /// hook install right now (caller sends it as `.err`); null on success.
+    pub fn startHook(self: *Session, client_id: u32, now_ns: i128) !?[]const u8 {
+        if (self.hook_pending != null)
+            return "hook: another install already in progress";
+        if (self.isAltScreen())
+            return "hook: session is in a full-screen app, not a shell prompt";
+        // A just-typed run that hasn't been accepted yet would have its
+        // preexec eaten by echo_swallow. The window is milliseconds; refusing
+        // is simpler than trying to interleave.
+        if (self.pendingAcceptance())
+            return "hook: a `run` request is mid-acceptance; retry in a moment";
+
+        const probe = try shell.wrapPaste(self.gpa, shell.probe_line);
+        defer self.gpa.free(probe);
+        try self.pty_input.appendSlice(self.gpa, probe);
+
+        const window = @max(2 * std.time.ns_per_s, 3 * self.last_preexec_latency_ns);
+        self.hook_pending = .{
+            .client_id = client_id,
+            .phase = .probing,
+            .deadline_ns = now_ns + window,
+        };
+        return null;
     }
 
-    /// Remove and return the front request. Caller must pass it to complete()
-    /// (which frees cmd) or free cmd itself.
-    fn popFront(self: *Session) RunRequest {
-        assert(self.run_queue.items.len > 0);
-        return self.run_queue.orderedRemove(0);
+    /// Daemon polls this each tick. Non-null exactly once per install.
+    pub fn takeHookCompletion(self: *Session) ?HookCompletion {
+        defer self.hook_completed = null;
+        return self.hook_completed;
+    }
+
+    /// Called periodically by the daemon. Times out a stuck probe/install.
+    pub fn checkHookTimeout(self: *Session, now_ns: i128) void {
+        const hp = self.hook_pending orelse return;
+        if (now_ns < hp.deadline_ns) return;
+        self.completeHook(.{ .err = switch (hp.phase) {
+            .probing => "hook: no response to probe — not at a bash/zsh/fish prompt?",
+            .installing => "hook: install did not complete (no prompt after sourcing hook)",
+        } });
+    }
+
+    fn onProbe(self: *Session, p: @FieldType(protocol.Event, "probe")) !void {
+        const hp = &(self.hook_pending orelse return);
+        if (hp.phase != .probing) return;
+
+        if (p.hook_v >= shell.hook_version)
+            return self.completeHook(.{ .already_hooked = p.hook_v });
+        if (p.shell == .unknown)
+            return self.completeHook(.{ .err = "hook: not bash, zsh, or fish" });
+        if (p.shell == .bash and p.shell_major < 4)
+            return self.completeHook(.{
+                .err = "hook: bash < 4 lacks bracketed-paste; cannot hook",
+            });
+
+        hp.shell = p.shell;
+        const inst = try shell.buildInstall(self.gpa, p.shell);
+        defer self.gpa.free(inst);
+        try self.pty_input.appendSlice(self.gpa, inst);
+
+        const window = @max(5 * std.time.ns_per_s, 6 * self.last_preexec_latency_ns);
+        hp.phase = .installing;
+        hp.deadline_ns = std.time.nanoTimestamp() + window;
+    }
+
+    fn completeHook(self: *Session, r: HookResult) void {
+        const hp = self.hook_pending.?;
+        self.hook_completed = .{ .client_id = hp.client_id, .result = r };
+        self.hook_pending = null;
+        // A run queued during the install can now be typed.
+        self.tryTypeNext() catch {};
+    }
+
+    // ───────────────────────── internals ─────────────────────────
+
+    fn firstUnsent(self: *Session) ?*RunRequest {
+        for (self.run_queue.items) |*r| if (!r.sent) return r;
+        return null;
     }
 
     fn complete(self: *Session, req: RunRequest, result: RunCompletion) !void {
@@ -454,27 +852,31 @@ pub const Session = struct {
         });
     }
 
-    /// Can a queued command be typed right now?
+    /// Can a queued command be typed into the top layer right now?
     fn canType(self: *Session) bool {
-        if (self.cmd_running) return false;
         if (self.isAltScreen()) return false;
+        // Hook install owns the prompt; a `run` typed alongside would have
+        // its preexec/done eaten by echo_swallow and then be ^C'd.
+        if (self.hook_pending != null) return false;
+        // Need at least one layer (hello/done/?2004h has arrived).
+        const t = self.top() orelse return false;
+        if (t.cmd_running) return false;
         // Hook injection in flight: wait for its `done` (which sets `hooked`)
         // so the request lands on a hooked prompt. Matters for fish, where
         // `?2004h` precedes `fish_prompt` and would otherwise look like a
         // ready-but-unhooked prompt.
-        if (self.inject_echo_pending > 0) return false;
-        // Need at least one prompt-readiness signal: either the hook is live
-        // or we've seen bracketed-paste-on (degraded path).
-        if (!self.hooked and !self.seen_prompt) return false;
-        // Don't type over an already-in-flight request.
-        if (self.front()) |r| if (r.sent) return false;
+        if (t.inject_pending > 0) return false;
+        // Degraded layer: need at least one ?2004h.
+        if (!t.hooked and !self.seen_prompt) return false;
+        // Don't type over an already-in-flight request at this depth.
+        if (self.sentAt(self.topDepth()) != null) return false;
         return true;
     }
 
     fn tryTypeNext(self: *Session) !void {
-        if (self.run_queue.items.len == 0) return;
+        const r = self.firstUnsent() orelse return;
         if (!self.canType()) return;
-        try self.typeCommand(&self.run_queue.items[0]);
+        try self.typeCommand(r);
     }
 
     /// Ctrl-U, bracketed-paste, cmd, end-paste, CR.
@@ -484,6 +886,8 @@ pub const Session = struct {
         try self.pty_input.appendSlice(self.gpa, "\x1b[201~\r");
         req.sent = true;
         req.started_ns = std.time.nanoTimestamp();
+        req.layer_depth = self.topDepth();
+        req.expect_preexec = self.top().?.hooked;
     }
 
     fn msSince(start_ns: i128, now_ns: i128) u64 {
@@ -497,24 +901,26 @@ pub const Session = struct {
 
 const testing = std.testing;
 
-fn doneOsc(buf: []u8, nonce: []const u8, ec: i32, cwd: []const u8, dur: u64) []const u8 {
+const TPID: i32 = 100;
+
+fn doneOsc(buf: []u8, pid: i32, ec: i32, cwd: []const u8, dur: u64) []const u8 {
     return std.fmt.bufPrint(
         buf,
-        "\x1b]2718;done;{s};{d};{d};{s}\x07",
-        .{ nonce, ec, dur, cwd },
+        "\x1b]2718;done;{d};{d};{d};{s}\x07",
+        .{ pid, ec, dur, cwd },
     ) catch unreachable;
 }
 
-fn preexecOsc(buf: []u8, nonce: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "\x1b]2718;preexec;{s}\x07", .{nonce}) catch unreachable;
+fn preexecOsc(buf: []u8, pid: i32) []const u8 {
+    return std.fmt.bufPrint(buf, "\x1b]2718;preexec;{d}\x07", .{pid}) catch unreachable;
 }
 
 /// Bring a fresh session to the hooked+idle state (hello, drain inject, done).
 fn hookAndIdle(s: *Session) !void {
-    try s.feedPtyOutput("\x1b]2718;hello;bash\x07");
+    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
     s.consumePtyInput(s.pendingPtyInput().len);
     var b: [128]u8 = undefined;
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 0, "/", 0));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
     s.clearCompletions();
 }
 
@@ -522,13 +928,13 @@ test "hello queues hook injection" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
 
-    try s.feedPtyOutput("\x1b]2718;hello;bash\x07");
-    try testing.expectEqual(protocol.Shell.bash, s.shell);
-    try testing.expect(!s.hooked);
+    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    try testing.expectEqual(protocol.Shell.bash, s.topShell());
+    try testing.expect(!s.topHooked());
 
     const inp = s.pendingPtyInput();
     try testing.expect(std.mem.startsWith(u8, inp, "\x15\x1b[200~"));
-    try testing.expect(std.mem.indexOf(u8, inp, "__ZMX_HOOKED") != null);
+    try testing.expect(std.mem.indexOf(u8, inp, "__ZMYTH_HOOK_V") != null);
     try testing.expect(std.mem.endsWith(u8, inp, "\x1b[201~\r"));
 }
 
@@ -536,14 +942,14 @@ test "first done sets hooked + last_exit" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
 
-    try s.feedPtyOutput("\x1b]2718;hello;bash\x07");
+    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
     s.consumePtyInput(s.pendingPtyInput().len);
 
     var b: [128]u8 = undefined;
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 42, "/tmp", 7));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 42, "/tmp", 7));
 
-    try testing.expect(s.hooked);
-    try testing.expect(!s.cmd_running);
+    try testing.expect(s.topHooked());
+    try testing.expect(!s.topCmdRunning());
     try testing.expectEqual(@as(?i32, 42), s.last_exit);
     try testing.expectEqualStrings("/tmp", s.lastCwd());
     try testing.expectEqual(@as(usize, 0), s.completions().len);
@@ -554,17 +960,17 @@ test "queueRun while idle: type, preexec, done -> completion" {
     defer s.deinit();
     try hookAndIdle(&s);
 
-    try s.queueRun(1, "echo hi");
+    try s.queueRun(1, "echo hi", false);
     const want = "\x15\x1b[200~echo hi\x1b[201~\r";
     try testing.expect(std.mem.endsWith(u8, s.pendingPtyInput(), want));
     try testing.expect(s.run_queue.items[0].sent);
 
     var b: [128]u8 = undefined;
-    try s.feedPtyOutput(preexecOsc(&b, &s.nonce));
-    try testing.expect(s.cmd_running);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try testing.expect(s.topCmdRunning());
     try testing.expect(s.run_queue.items[0].accepted);
 
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 0, "/tmp", 5));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/tmp", 5));
     const comps = s.completions();
     try testing.expectEqual(@as(usize, 1), comps.len);
     try testing.expectEqual(@as(u32, 1), comps[0].client_id);
@@ -580,19 +986,19 @@ test "queueRun while busy waits for done" {
     try hookAndIdle(&s);
 
     var b: [128]u8 = undefined;
-    try s.queueRun(1, "first");
+    try s.queueRun(1, "first", false);
     s.consumePtyInput(s.pendingPtyInput().len);
-    try s.feedPtyOutput(preexecOsc(&b, &s.nonce));
-    try testing.expect(s.cmd_running);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try testing.expect(s.topCmdRunning());
 
     // Second request arrives mid-command.
-    try s.queueRun(2, "second");
+    try s.queueRun(2, "second", false);
     try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
     try testing.expectEqual(@as(usize, 2), s.run_queue.items.len);
     try testing.expect(!s.run_queue.items[1].sent);
 
     // First done -> complete #1 and type #2.
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 0, "/", 1));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 1));
     try testing.expectEqual(@as(usize, 1), s.completions().len);
     try testing.expectEqual(@as(u32, 1), s.completions()[0].client_id);
     try testing.expect(std.mem.endsWith(u8, s.pendingPtyInput(), "second\x1b[201~\r"));
@@ -606,9 +1012,9 @@ test "prompt-fallback when not hooked" {
     // No hello/hook. First ?2004h marks the prompt as ready (degraded path).
     try s.feedPtyOutput("\x1b[?2004h");
     try testing.expect(s.seen_prompt);
-    try testing.expect(!s.hooked);
+    try testing.expect(!s.topHooked());
 
-    try s.queueRun(7, "echo hi");
+    try s.queueRun(7, "echo hi", false);
     try testing.expect(std.mem.endsWith(u8, s.pendingPtyInput(), "echo hi\x1b[201~\r"));
 
     // Shell echoes the command, returns to prompt -> ?2004h again.
@@ -625,13 +1031,13 @@ test "prompt ignored when hooked" {
     defer s.deinit();
     try hookAndIdle(&s);
 
-    try s.queueRun(1, "x");
+    try s.queueRun(1, "x", false);
     var b: [128]u8 = undefined;
-    try s.feedPtyOutput(preexecOsc(&b, &s.nonce));
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
     // Hooked: ?2004h is not authoritative, done is.
     try s.feedPtyOutput("\x1b[?2004h");
     try testing.expectEqual(@as(usize, 0), s.completions().len);
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 3, "/", 1));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 3, "/", 1));
     try testing.expectEqual(@as(usize, 1), s.completions().len);
     try testing.expectEqual(@as(?i32, 3), s.completions()[0].result.exit_code);
 }
@@ -644,7 +1050,7 @@ test "alt-screen gates typing" {
     try s.feedPtyOutput("\x1b[?1049h");
     try testing.expect(s.isAltScreen());
 
-    try s.queueRun(1, "echo hi");
+    try s.queueRun(1, "echo hi", false);
     try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
     try testing.expect(!s.run_queue.items[0].sent);
 
@@ -652,7 +1058,7 @@ test "alt-screen gates typing" {
     var seq: std.ArrayList(u8) = .empty;
     defer seq.deinit(testing.allocator);
     try seq.appendSlice(testing.allocator, "\x1b[?1049l");
-    try seq.appendSlice(testing.allocator, doneOsc(&b, &s.nonce, 0, "/", 1));
+    try seq.appendSlice(testing.allocator, doneOsc(&b, TPID, 0, "/", 1));
     try s.feedPtyOutput(seq.items);
 
     try testing.expect(!s.isAltScreen());
@@ -666,7 +1072,7 @@ test "checkAcceptanceTimeout sends ^C and rejects" {
     defer s.deinit();
     try hookAndIdle(&s);
 
-    try s.queueRun(9, "echo \"unclosed");
+    try s.queueRun(9, "echo \"unclosed", false);
     try testing.expect(s.run_queue.items[0].sent);
 
     // Window doesn't open until bytes hit the PTY.
@@ -694,7 +1100,7 @@ test "checkAcceptanceTimeout disabled when not hooked" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
     try s.feedPtyOutput("\x1b[?2004h");
-    try s.queueRun(1, "sleep 5");
+    try s.queueRun(1, "sleep 5", false);
     s.consumePtyInput(s.pendingPtyInput().len);
     try testing.expect(!s.checkAcceptanceTimeout(std.math.maxInt(i64)));
 }
@@ -704,17 +1110,17 @@ test "two dones in one chunk don't misattribute" {
     defer s.deinit();
     try hookAndIdle(&s);
 
-    try s.queueRun(1, "a");
-    try s.queueRun(2, "b");
+    try s.queueRun(1, "a", false);
+    try s.queueRun(2, "b", false);
     s.consumePtyInput(s.pendingPtyInput().len);
     var b: [128]u8 = undefined;
-    try s.feedPtyOutput(preexecOsc(&b, &s.nonce));
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
 
     // One chunk: done(a, ec=7) immediately followed by a stray done(ec=99).
     var chunk: std.ArrayList(u8) = .empty;
     defer chunk.deinit(testing.allocator);
-    try chunk.appendSlice(testing.allocator, doneOsc(&b, &s.nonce, 7, "/", 1));
-    try chunk.appendSlice(testing.allocator, doneOsc(&b, &s.nonce, 99, "/", 1));
+    try chunk.appendSlice(testing.allocator, doneOsc(&b, TPID, 7, "/", 1));
+    try chunk.appendSlice(testing.allocator, doneOsc(&b, TPID, 99, "/", 1));
     try s.feedPtyOutput(chunk.items);
 
     // Only req#1 completed; req#2 was typed at end-of-chunk, NOT completed.
@@ -730,11 +1136,11 @@ test "checkAcceptanceTimeout ignored once accepted" {
     defer s.deinit();
     try hookAndIdle(&s);
 
-    try s.queueRun(1, "sleep 10");
+    try s.queueRun(1, "sleep 10", false);
     s.consumePtyInput(s.pendingPtyInput().len);
     const tf = s.run_queue.items[0].flushed_ns;
     var b: [128]u8 = undefined;
-    try s.feedPtyOutput(preexecOsc(&b, &s.nonce));
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
 
     try testing.expect(!s.checkAcceptanceTimeout(tf + 10 * std.time.ns_per_s));
     try testing.expectEqual(@as(usize, 0), s.completions().len);
@@ -745,8 +1151,8 @@ test "onPtyEof completes all queued" {
     defer s.deinit();
     try hookAndIdle(&s);
 
-    try s.queueRun(1, "exec true");
-    try s.queueRun(2, "never runs");
+    try s.queueRun(1, "exec true", false);
+    try s.queueRun(2, "never runs", false);
     try testing.expectEqual(@as(usize, 2), s.run_queue.items.len);
 
     // Exit code 5 in the high byte of wait status.
@@ -783,8 +1189,8 @@ test "queueSend is raw passthrough" {
 test "hello with unknown shell skips inject" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
-    try s.feedPtyOutput("\x1b]2718;hello;powershell\x07");
-    try testing.expectEqual(protocol.Shell.unknown, s.shell);
+    try s.feedPtyOutput("\x1b]2718;hello;powershell;1\x07");
+    try testing.expectEqual(protocol.Shell.unknown, s.topShell());
     try testing.expect(s.unhookable);
     try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
 }
@@ -793,10 +1199,10 @@ test "unhookable hello fails queued run immediately (bash <4 path)" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
     // Cold-start race: run arrives before hello.
-    try s.queueRun(5, "true");
+    try s.queueRun(5, "true", false);
     try testing.expect(!s.run_queue.items[0].sent);
     // bash 3.2 rc shim announces as bash-pre4 → .unknown → unhookable.
-    try s.feedPtyOutput("\x1b]2718;hello;bash-pre4\x07");
+    try s.feedPtyOutput("\x1b]2718;hello;bash-pre4;1\x07");
     try testing.expect(s.unhookable);
     // checkPromptWait should fail it now, not in 30s.
     const r = s.checkPromptWait(s.run_queue.items[0].queued_ns + std.time.ns_per_ms);
@@ -827,7 +1233,7 @@ test "queueRun with 2MB command is buffered without leak" {
     defer testing.allocator.free(big);
     @memset(big, 'x');
 
-    try s.queueRun(1, big);
+    try s.queueRun(1, big, false);
     try testing.expectEqual(@as(usize, 1), s.run_queue.items.len);
     try testing.expect(s.run_queue.items[0].sent);
     try testing.expect(s.pendingPtyInput().len > Session.pty_input_cap);
@@ -840,9 +1246,9 @@ test "cancelClientRuns drops only unsent for that client" {
     defer s.deinit();
     try hookAndIdle(&s);
 
-    try s.queueRun(1, "a"); // typed immediately (idle, hooked)
-    try s.queueRun(2, "b"); // queued, unsent
-    try s.queueRun(1, "c"); // queued, unsent
+    try s.queueRun(1, "a", false); // typed immediately (idle, hooked)
+    try s.queueRun(2, "b", false); // queued, unsent
+    try s.queueRun(1, "c", false); // queued, unsent
     try testing.expect(s.run_queue.items[0].sent);
     try testing.expect(!s.run_queue.items[1].sent);
     try testing.expect(!s.run_queue.items[2].sent);
@@ -864,34 +1270,34 @@ test "two hellos before first done: second inject's echo not misattributed" {
 
     // Outer shell announces, then a nested shell announces before the outer
     // inject's done arrives.
-    try s.feedPtyOutput("\x1b]2718;hello;bash\x07");
-    try s.feedPtyOutput("\x1b]2718;hello;bash\x07");
-    try testing.expectEqual(@as(u8, 2), s.inject_echo_pending);
+    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    try testing.expectEqual(@as(u8, 2), s.top().?.inject_pending);
     s.consumePtyInput(s.pendingPtyInput().len);
 
-    try s.queueRun(1, "real");
+    try s.queueRun(1, "real", false);
     try testing.expect(!s.run_queue.items[0].sent);
 
     var b: [128]u8 = undefined;
     // First inject's done: counter 2→1. Request must NOT be typed yet (with
     // the old bool this would have flipped to false and typed it).
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 0, "/", 0));
-    try testing.expectEqual(@as(u8, 1), s.inject_echo_pending);
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
+    try testing.expectEqual(@as(u8, 1), s.top().?.inject_pending);
     try testing.expect(!s.run_queue.items[0].sent);
     try testing.expectEqual(@as(usize, 0), s.completions().len);
 
     // Second inject's preexec+done: swallowed, counter 1→0, THEN request is
     // typed. With the old bool the preexec/done here would have been credited
     // to the (prematurely-typed) request.
-    try s.feedPtyOutput(preexecOsc(&b, &s.nonce));
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 99, "/", 0));
-    try testing.expectEqual(@as(u8, 0), s.inject_echo_pending);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 99, "/", 0));
+    try testing.expectEqual(@as(u8, 0), s.top().?.inject_pending);
     try testing.expect(s.run_queue.items[0].sent);
     try testing.expectEqual(@as(usize, 0), s.completions().len);
 
     // Real command's preexec+done.
-    try s.feedPtyOutput(preexecOsc(&b, &s.nonce));
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 7, "/", 3));
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 7, "/", 3));
     try testing.expectEqual(@as(usize, 1), s.completions().len);
     try testing.expectEqual(@as(?i32, 7), s.completions()[0].result.exit_code);
 }
@@ -903,11 +1309,11 @@ test "stuck inject_echo_pending recovers after 5s" {
 
     // Nested shell hellos; we queue an inject and bump the counter — but the
     // shell dies before emitting `done`, so the counter never drains.
-    try s.feedPtyOutput("\x1b]2718;hello;bash\x07");
+    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
     s.consumePtyInput(s.pendingPtyInput().len);
-    try testing.expectEqual(@as(u8, 1), s.inject_echo_pending);
+    try testing.expectEqual(@as(u8, 1), s.top().?.inject_pending);
 
-    try s.queueRun(5, "echo hi");
+    try s.queueRun(5, "echo hi", false);
     const t0 = s.run_queue.items[0].queued_ns;
     try testing.expect(!s.run_queue.items[0].sent); // wedged
 
@@ -918,7 +1324,7 @@ test "stuck inject_echo_pending recovers after 5s" {
     // After 5s: recovery forces the counter to 0, types the request, warns.
     const pw = s.checkPromptWait(t0 + 6 * std.time.ns_per_s);
     try testing.expectEqual(@as(u32, 5), pw.warn);
-    try testing.expectEqual(@as(u8, 0), s.inject_echo_pending);
+    try testing.expectEqual(@as(u8, 0), s.top().?.inject_pending);
     try testing.expect(s.run_queue.items[0].sent);
 
     // Subsequent ticks are quiet.
@@ -931,19 +1337,20 @@ test "degraded->hooked transition does not ^C pre-hook request" {
 
     // Degraded mode: prompt seen, no hook. Request is typed without preexec.
     try s.feedPtyOutput("\x1b[?2004h");
-    try s.queueRun(3, "sleep 60");
+    try s.queueRun(3, "sleep 60", false);
     try testing.expect(s.run_queue.items[0].sent);
     s.consumePtyInput(s.pendingPtyInput().len);
     try testing.expect(s.run_queue.items[0].flushed_ns != 0);
 
     // While that command runs, a nested shell announces and its inject's
     // `done` flips hooked=true.
-    try s.feedPtyOutput("\x1b]2718;hello;bash\x07");
+    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
     s.consumePtyInput(s.pendingPtyInput().len);
     var b: [128]u8 = undefined;
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 0, "/", 0));
-    try testing.expect(s.hooked);
-    try testing.expect(s.run_queue.items[0].started_ns < s.hooked_since_ns);
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
+    try testing.expect(s.topHooked());
+    // Captured at type time, before the layer hooked.
+    try testing.expect(!s.run_queue.items[0].expect_preexec);
 
     // The request was typed before the hook went live, so the acceptance
     // timeout must NOT ^C it even though accepted=false and hooked=true.
@@ -962,16 +1369,16 @@ test "acceptance timeout adapts to observed preexec latency" {
     var b: [128]u8 = undefined;
     // First command: backdate flushed_ns so the preexec that follows records
     // a ~800ms round-trip (simulating a hooked shell behind a slow SSH link).
-    try s.queueRun(1, "a");
+    try s.queueRun(1, "a", false);
     s.consumePtyInput(s.pendingPtyInput().len);
     s.run_queue.items[0].flushed_ns = std.time.nanoTimestamp() - 800 * std.time.ns_per_ms;
-    try s.feedPtyOutput(preexecOsc(&b, &s.nonce));
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
     try testing.expect(s.last_preexec_latency_ns >= 800 * std.time.ns_per_ms);
-    try s.feedPtyOutput(doneOsc(&b, &s.nonce, 0, "/", 1));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 1));
     s.clearCompletions();
 
     // Second command: window is now max(1s, 3 * ~800ms) ≈ 2.4s.
-    try s.queueRun(2, "b");
+    try s.queueRun(2, "b", false);
     s.consumePtyInput(s.pendingPtyInput().len);
     const tf = s.run_queue.items[0].flushed_ns;
     const window = @max(ACCEPT_TIMEOUT_NS, 3 * s.last_preexec_latency_ns);
@@ -992,13 +1399,13 @@ test "checkPromptWait warns for request queued behind a running command" {
     var b: [128]u8 = undefined;
     // First request: typed and accepted; runs indefinitely (e.g. ssh with no
     // remote announce → cmd_running stays true, no `done` ever arrives).
-    try s.queueRun(1, "ssh remote");
+    try s.queueRun(1, "ssh remote", false);
     s.consumePtyInput(s.pendingPtyInput().len);
-    try s.feedPtyOutput(preexecOsc(&b, &s.nonce));
-    try testing.expect(s.cmd_running);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try testing.expect(s.topCmdRunning());
 
     // Second request: blocked on cmd_running.
-    try s.queueRun(2, "ls");
+    try s.queueRun(2, "ls", false);
     try testing.expect(!s.run_queue.items[1].sent);
     const t0 = s.run_queue.items[1].queued_ns;
 
@@ -1014,11 +1421,457 @@ test "checkPromptWait warns for request queued behind a running command" {
     try testing.expectEqual(@as(usize, 0), s.completions().len);
 }
 
+// ───────── hook install state machine ─────────
+
+test "startHook queues probe and arms" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    try testing.expectEqual(@as(?[]const u8, null), try s.startHook(7, 0));
+    try testing.expect(s.hook_pending.?.phase == .probing);
+    try testing.expect(std.mem.indexOf(u8, s.pendingPtyInput(), "$__ZMYTH_HOOK_V") != null);
+    try testing.expect(s.takeHookCompletion() == null);
+}
+
+test "startHook refused: alt-screen / run in flight / concurrent" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    try s.feedPtyOutput("\x1b[?1049h");
+    try testing.expect((try s.startHook(1, 0)) != null);
+    try s.feedPtyOutput("\x1b[?1049l");
+
+    try s.queueRun(1, "x", false);
+    try testing.expect((try s.startHook(1, 0)) != null);
+    s.cancelClientRuns(1);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    var b: [128]u8 = undefined;
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
+    s.clearCompletions();
+
+    try testing.expectEqual(@as(?[]const u8, null), try s.startHook(1, 0));
+    try testing.expect((try s.startHook(2, 0)) != null);
+}
+
+test "hook: probe reports already hooked → no install typed" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    _ = try s.startHook(7, 0);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    var b: [128]u8 = undefined;
+    // Local hooked layer brackets the probe with preexec/done; the probe OSC
+    // arrives between them. echo_swallow ensures the done isn't taken as the
+    // install completion.
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput("\x1b]2718;probe;b=5.2,z=,f=,h=1\x07");
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
+
+    const c = s.takeHookCompletion().?;
+    try testing.expectEqual(@as(u32, 7), c.client_id);
+    try testing.expectEqual(@as(u32, 1), c.result.already_hooked);
+    try testing.expect(s.hook_pending == null);
+    // No install was typed.
+    try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
+    // The bracketing done was swallowed (no run-queue effect, last_exit ok).
+    try testing.expectEqual(@as(?i32, 0), s.last_exit);
+}
+
+test "hook: probe → install → done completes" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    // Nested-shell scenario: outer layer is *not* the one being hooked, so
+    // simulate by going straight to a degraded prompt (no local hook).
+    try s.feedPtyOutput("\x1b[?2004h");
+
+    _ = try s.startHook(9, 0);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    // Remote (unhooked) shell emits probe OSC, no preexec/done bracket.
+    try s.feedPtyOutput("\x1b]2718;probe;b=,z=5.9,f=,h=\x07");
+    try testing.expect(s.hook_pending.?.phase == .installing);
+    // Install was queued: paste + body in one go.
+    const inp = s.pendingPtyInput();
+    try testing.expect(std.mem.indexOf(u8, inp, "head -c ") != null);
+    try testing.expect(std.mem.indexOf(u8, inp, "${ZDOTDIR:-$HOME}/.zshrc") != null);
+    try testing.expect(std.mem.endsWith(u8, inp, shell.hookBody(.zsh)));
+    s.consumePtyInput(inp.len);
+
+    // Newly-hooked layer reaches its first prompt → first done.
+    var b: [128]u8 = undefined;
+    try s.feedPtyOutput(doneOsc(&b, 555, 0, "/home/u", 0));
+    const c = s.takeHookCompletion().?;
+    try testing.expectEqual(@as(u32, 9), c.client_id);
+    try testing.expectEqual(protocol.Shell.zsh, c.result.installed);
+    try testing.expect(s.hook_pending == null);
+    try testing.expect(s.topHooked());
+    try testing.expectEqualStrings("/home/u", s.lastCwd());
+    // takeHookCompletion is one-shot.
+    try testing.expect(s.takeHookCompletion() == null);
+}
+
+test "hook: probe says unknown shell → err, no install" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try s.feedPtyOutput("\x1b[?2004h");
+    _ = try s.startHook(1, 0);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput("\x1b]2718;probe;b=,z=,f=,h=\x07");
+    try testing.expect(s.takeHookCompletion().?.result == .err);
+    try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
+}
+
+test "hook: bash <4 → err" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try s.feedPtyOutput("\x1b[?2004h");
+    _ = try s.startHook(1, 0);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput("\x1b]2718;probe;b=3.2.57(1)-release,z=,f=,h=\x07");
+    try testing.expect(s.takeHookCompletion().?.result == .err);
+}
+
+test "hook: probe timeout" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try s.feedPtyOutput("\x1b[?2004h");
+    _ = try s.startHook(1, 0);
+    s.checkHookTimeout(std.time.ns_per_s); // before deadline
+    try testing.expect(s.hook_pending != null);
+    s.checkHookTimeout(10 * std.time.ns_per_s);
+    try testing.expect(s.takeHookCompletion().?.result == .err);
+    try testing.expect(s.hook_pending == null);
+}
+
+test "hook: install in already-hooked outer; outer's preexec/done swallowed" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    _ = try s.startHook(3, 0);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    var b: [128]u8 = undefined;
+    // Outer brackets probe; probe says NOT hooked (h=) — contrived (outer is
+    // hooked, but inner var unset because inner shell hasn't sourced hook):
+    // models `attach`→`ssh`→hook where outer is hooked, inner isn't, and the
+    // outer preexec/done leak through ssh… actually outer is running ssh so
+    // it doesn't bracket. The realistic case for echo_swallow during install
+    // is when probe ran in outer (h=1, already_hooked) — covered above. This
+    // test pins that a stray preexec during .installing doesn't misfire.
+    try s.feedPtyOutput("\x1b]2718;probe;b=5.2,z=,f=,h=\x07");
+    try testing.expect(s.hook_pending.?.phase == .installing);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    // Stray preexec (outer somehow): swallowed, paired done swallowed.
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
+    try testing.expect(s.hook_pending != null);
+    try testing.expect(s.takeHookCompletion() == null);
+    // The freshly-hooked inner's first done (no preexec preceded it).
+    try s.feedPtyOutput(doneOsc(&b, 999, 0, "/", 0));
+    try testing.expectEqual(protocol.Shell.bash, s.takeHookCompletion().?.result.installed);
+}
+
+test "queueRun while hook_pending defers typing" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    _ = try s.startHook(1, 0);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    // run arrives mid-probe: must NOT be typed.
+    try s.queueRun(2, "ls", false);
+    try testing.expect(!s.run_queue.items[0].sent);
+    try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
+
+    // Probe says already-hooked → hook completes.
+    var b: [128]u8 = undefined;
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput("\x1b]2718;probe;b=5.2,z=,f=,h=1\x07");
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
+    try testing.expect(s.takeHookCompletion() != null);
+    // Now the queued run is typed.
+    try testing.expect(s.run_queue.items[0].sent);
+}
+
+// ───────── PID-stack + run -i ─────────
+
+test "run -i: ?2004h after preexec → at_prompt + degraded layer pushed" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+    var b: [128]u8 = undefined;
+
+    try s.queueRun(1, "ssh remote", true);
+    try testing.expect(s.run_queue.items[0].sent);
+    try testing.expectEqual(@as(u8, 0), s.run_queue.items[0].layer_depth);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try testing.expect(s.run_queue.items[0].accepted);
+
+    // Remote (unhooked) prompt appears.
+    try s.feedPtyOutput("\x1b[?2004h");
+    const c = s.completions();
+    try testing.expectEqual(@as(usize, 1), c.len);
+    try testing.expect(c[0].result.via == .at_prompt);
+    try testing.expectEqual(@as(?i32, 0), c[0].result.exit_code);
+    try testing.expectEqual(@as(usize, 0), s.run_queue.items.len);
+    // Degraded nested layer pushed.
+    try testing.expectEqual(@as(u8, 2), s.layers.len);
+    try testing.expectEqual(@as(i32, 0), s.top().?.pid);
+    try testing.expect(!s.topHooked());
+    s.clearCompletions();
+
+    // A subsequent run types into the new top (depth 1), not the busy outer.
+    try s.queueRun(2, "ls", false);
+    try testing.expect(s.run_queue.items[0].sent);
+    try testing.expectEqual(@as(u8, 1), s.run_queue.items[0].layer_depth);
+    try testing.expect(!s.run_queue.items[0].expect_preexec);
+    // Unhooked top: ?2004h is the completion signal.
+    try s.feedPtyOutput("\x1b[?2004h");
+    try testing.expect(s.completions()[0].result.via == .prompt_fallback);
+}
+
+test "run -i: done from new pid → at_prompt + hooked layer pushed" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+    var b: [128]u8 = undefined;
+
+    try s.queueRun(1, "ssh remote", true);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+
+    // Remote has a file-installed hook → first prompt emits done from new pid.
+    try s.feedPtyOutput(doneOsc(&b, 555, 0, "/home/r", 0));
+    try testing.expect(s.completions()[0].result.via == .at_prompt);
+    try testing.expectEqual(@as(u8, 2), s.layers.len);
+    try testing.expectEqual(@as(i32, 555), s.top().?.pid);
+    try testing.expect(s.topHooked());
+    try testing.expectEqualStrings("/home/r", s.lastCwd());
+    s.clearCompletions();
+
+    // Nested run types at depth 1; remote done completes it.
+    try s.queueRun(2, "ls", false);
+    try testing.expectEqual(@as(u8, 1), s.run_queue.items[0].layer_depth);
+    try testing.expect(s.run_queue.items[0].expect_preexec);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, 555));
+    try s.feedPtyOutput(doneOsc(&b, 555, 7, "/home/r", 3));
+    try testing.expectEqual(@as(?i32, 7), s.completions()[0].result.exit_code);
+    try testing.expect(s.completions()[0].result.via == .osc_done);
+}
+
+test "run -i: command exits without nested prompt → osc_done (not at_prompt)" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+    var b: [128]u8 = undefined;
+
+    // run -i on a command that just exits (no nested shell).
+    try s.queueRun(1, "false", true);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 1, "/", 5));
+    try testing.expectEqual(@as(?i32, 1), s.completions()[0].result.exit_code);
+    try testing.expect(s.completions()[0].result.via == .osc_done);
+    try testing.expectEqual(@as(u8, 1), s.layers.len);
+}
+
+test "layer pop: done from below-top pid pops + completes dangling run" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+    var b: [128]u8 = undefined;
+
+    try s.queueRun(1, "ssh remote", true);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput(doneOsc(&b, 555, 0, "/", 0));
+    s.clearCompletions();
+    try testing.expectEqual(@as(u8, 2), s.layers.len);
+
+    // Type into layer 1, accept, but don't complete.
+    try s.queueRun(2, "sleep 60", false);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, 555));
+    try testing.expect(s.run_queue.items[0].accepted);
+
+    // ssh exits → layer 0's done. Layer 1 popped; depth-1 run → layer_exited.
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 100));
+    try testing.expectEqual(@as(u8, 1), s.layers.len);
+    try testing.expectEqual(@as(i32, TPID), s.top().?.pid);
+    const c = s.completions();
+    try testing.expectEqual(@as(usize, 1), c.len);
+    try testing.expectEqual(@as(u32, 2), c[0].client_id);
+    try testing.expect(c[0].result.via == .layer_exited);
+    try testing.expectEqual(@as(?i32, 0), c[0].result.exit_code);
+    try testing.expectEqual(@as(usize, 0), s.run_queue.items.len);
+    try testing.expect(!s.topCmdRunning());
+}
+
+test "non-interactive run -- ssh: outer run survives nested layer push/pop" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+    var b: [128]u8 = undefined;
+
+    // Plain run (NOT -i): blocks until ssh exits.
+    try s.queueRun(1, "ssh remote", false);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    // Remote hooked → done;555. NOT interactive → does NOT complete the run.
+    try s.feedPtyOutput(doneOsc(&b, 555, 0, "/", 0));
+    try testing.expectEqual(@as(usize, 0), s.completions().len);
+    try testing.expectEqual(@as(u8, 2), s.layers.len);
+    try testing.expectEqual(@as(usize, 1), s.run_queue.items.len);
+
+    // Another client's run goes into layer 1 (top), even with the depth-0
+    // run still pending.
+    try s.queueRun(2, "ls", false);
+    try testing.expect(s.run_queue.items[1].sent);
+    try testing.expectEqual(@as(u8, 1), s.run_queue.items[1].layer_depth);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, 555));
+    try s.feedPtyOutput(doneOsc(&b, 555, 0, "/", 1));
+    // Only client 2's run completed; client 1's ssh still running.
+    try testing.expectEqual(@as(usize, 1), s.completions().len);
+    try testing.expectEqual(@as(u32, 2), s.completions()[0].client_id);
+    s.clearCompletions();
+
+    // ssh exits → done;100 → pop layer 1, complete client 1's run.
+    try s.feedPtyOutput(doneOsc(&b, TPID, 5, "/", 999));
+    try testing.expectEqual(@as(u8, 1), s.layers.len);
+    try testing.expectEqual(@as(usize, 1), s.completions().len);
+    try testing.expectEqual(@as(u32, 1), s.completions()[0].client_id);
+    try testing.expectEqual(@as(?i32, 5), s.completions()[0].result.exit_code);
+    try testing.expect(s.completions()[0].result.via == .osc_done);
+}
+
+test "degraded-top adoption: run -i ?2004h then hook installs → same layer" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+    var b: [128]u8 = undefined;
+
+    try s.queueRun(1, "ssh remote", true);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput("\x1b[?2004h"); // run -i completes, push degraded
+    s.clearCompletions();
+    try testing.expectEqual(@as(u8, 2), s.layers.len);
+    try testing.expectEqual(@as(i32, 0), s.top().?.pid);
+
+    // Now `zmyth hook` installs into the degraded top.
+    _ = try s.startHook(2, 0);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput("\x1b]2718;probe;b=5.2,z=,f=,h=\x07");
+    s.consumePtyInput(s.pendingPtyInput().len);
+    // Newly-hooked layer's first done: pid 555. Adopted into the placeholder,
+    // NOT stacked on top of it.
+    try s.feedPtyOutput(doneOsc(&b, 555, 0, "/", 0));
+    try testing.expectEqual(protocol.Shell.bash, s.takeHookCompletion().?.result.installed);
+    try testing.expectEqual(@as(u8, 2), s.layers.len);
+    try testing.expectEqual(@as(i32, 555), s.top().?.pid);
+    try testing.expect(s.topHooked());
+}
+
+test "headless: terminal query gets a response" {
+    // An app inside the session sends DSR (cursor position). With no attach
+    // client, ghostty's shadow terminal is the only thing that can answer —
+    // and it knows the cursor position. The response should land in pty_input
+    // so the app reads it from stdin.
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    // Put the cursor somewhere known, then query it.
+    try s.feedPtyOutput("\x1b[5;7H"); // CUP to row 5, col 7
+    try s.feedPtyOutput("\x1b[6n"); // DSR: report cursor position
+    try testing.expectEqualStrings("\x1b[5;7R", s.pendingPtyInput());
+    s.consumePtyInput(s.pendingPtyInput().len);
+
+    // DA1 (primary device attributes) — apps like nvim send this at startup.
+    try s.feedPtyOutput("\x1b[c");
+    try testing.expect(std.mem.startsWith(u8, s.pendingPtyInput(), "\x1b[?"));
+    s.consumePtyInput(s.pendingPtyInput().len);
+
+    // DECRQM (request mode state) for bracketed-paste.
+    try s.feedPtyOutput("\x1b[?2004$p");
+    // Response: CSI ? 2004 ; <0|1|2> $ y
+    try testing.expect(std.mem.startsWith(u8, s.pendingPtyInput(), "\x1b[?2004;"));
+}
+
+test "headless: query NOT answered when an attach client is present" {
+    // When a real terminal is attached, IT will answer (via passthrough), so
+    // ghostty must stay silent — otherwise the app gets two replies.
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    s.attached_clients = 1;
+    try s.feedPtyOutput("\x1b[6n");
+    try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
+
+    s.attached_clients = 0;
+    try s.feedPtyOutput("\x1b[6n");
+    try testing.expect(s.pendingPtyInput().len > 0);
+}
+
+test "ghostty-tracked state: title, mouse, osc133" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+
+    try testing.expect(s.title() == null);
+    try testing.expect(!s.mouseTracking());
+    try testing.expect(!s.osc133Seen());
+
+    try s.feedPtyOutput("\x1b]2;running vim\x07"); // OSC 2 set title
+    try testing.expectEqualStrings("running vim", s.title().?);
+
+    try s.feedPtyOutput("\x1b[?1002h"); // mouse button-event tracking
+    try testing.expect(s.mouseTracking());
+    try s.feedPtyOutput("\x1b[?1002l");
+    try testing.expect(!s.mouseTracking());
+
+    try s.feedPtyOutput("\x1b]133;A\x07"); // OSC 133 prompt-start
+    try testing.expect(s.osc133Seen());
+}
+
+test "max_layers overflow: top replaced, no panic" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    var b: [128]u8 = undefined;
+    var pid: i32 = 100;
+    while (pid < 100 + max_layers + 3) : (pid += 1) {
+        try s.feedPtyOutput(doneOsc(&b, pid, 0, "/", 0));
+    }
+    try testing.expectEqual(@as(u8, max_layers), s.layers.len);
+}
+
+test "cancelClientHook clears pending for that client only" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    _ = try s.startHook(7, 0);
+    try testing.expect(s.hook_pending != null);
+    s.cancelClientHook(99); // wrong client
+    try testing.expect(s.hook_pending != null);
+    s.cancelClientHook(7);
+    try testing.expect(s.hook_pending == null);
+    // New hook can start immediately.
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try testing.expectEqual(@as(?[]const u8, null), try s.startHook(8, 0));
+}
+
 test "checkPromptWait: warn at 5s, timeout at 30s, none once ready" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
     // No hello/done/?2004h yet — shell is "starting".
-    try s.queueRun(7, "echo hi");
+    try s.queueRun(7, "echo hi", false);
     const t0 = s.run_queue.items[0].queued_ns;
     try testing.expect(!s.run_queue.items[0].sent);
 
@@ -1035,6 +1888,6 @@ test "checkPromptWait: warn at 5s, timeout at 30s, none once ready" {
 
     // Once the prompt-ready signal arrives, no more warns/timeouts.
     try s.feedPtyOutput("\x1b[?2004h");
-    try s.queueRun(8, "echo hi");
+    try s.queueRun(8, "echo hi", false);
     try testing.expect(s.checkPromptWait(std.time.nanoTimestamp() + 60 * std.time.ns_per_s) == .none);
 }

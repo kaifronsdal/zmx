@@ -1,6 +1,5 @@
-if [[ -z "${__ZMX_HOOKED:-}" ]]; then
-  __ZMX_HOOKED=1
-  __ZMX_NONCE='__ZMX_NONCE__'
+if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
+  __ZMYTH_HOOK_V=1
   __ZMX_T0=
   __ZMX_AT_PROMPT=
   __ZMX_IN_PC=
@@ -12,7 +11,7 @@ if [[ -z "${__ZMX_HOOKED:-}" ]]; then
     [[ -z "$__ZMX_AT_PROMPT" ]] && return
     __ZMX_AT_PROMPT=
     __ZMX_T0=${EPOCHREALTIME:-}
-    printf '\033]2718;preexec;%s\007' "$__ZMX_NONCE"
+    printf '\033]2718;preexec;%s\007' "$$"
   }
   __zmx_precmd() {
     local dur=0
@@ -27,7 +26,7 @@ if [[ -z "${__ZMX_HOOKED:-}" ]]; then
     fi
     __ZMX_T0=
     __ZMX_IN_PC=
-    printf '\033]2718;done;%s;%d;%d;%s\007' "$__ZMX_NONCE" "${__ZMX_EC:-$?}" "$dur" "$PWD"
+    printf '\033]2718;done;%s;%d;%d;%s\007' "$$" "${__ZMX_EC:-$?}" "$dur" "$PWD"
     __ZMX_AT_PROMPT=1
     return $__ZMX_EC
   }

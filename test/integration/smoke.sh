@@ -9,7 +9,7 @@
 
 set -uo pipefail
 
-ZMX="${ZMX:-$(cd "$(dirname "$0")/../.." && pwd)/zig-out/bin/zmyth}"
+ZMX="${ZMYTH:-$(cd "$(dirname "$0")/../.." && pwd)/zig-out/bin/zmyth}"
 export ZMYTH_DIR=$(mktemp -d /tmp/zmyth-itest-XXXXXX)
 export XDG_STATE_HOME="$ZMYTH_DIR/state"
 unset ZMYTH_SESSION

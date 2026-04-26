@@ -52,11 +52,7 @@ fn ensureDir(path: []const u8) !void {
     // Open the leaf as a directory without following symlinks, verify
     // ownership and that it isn't group/other-writable, then tighten perms
     // via the held fd so the check and the chmod hit the same inode.
-    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
-    if (path.len > buf.len) return error.NameTooLong;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    const fd = try posix.openZ(buf[0..path.len :0], .{
+    const fd = try posix.open(path, .{
         .ACCMODE = .RDONLY,
         .DIRECTORY = true,
         .NOFOLLOW = true,
@@ -202,7 +198,7 @@ pub fn listSessions(allocator: Allocator) ![][]u8 {
 
     std.mem.sort([]u8, out.items, {}, struct {
         fn lt(_: void, a: []u8, b: []u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+            return std.mem.lessThan(u8, a, b);
         }
     }.lt);
 

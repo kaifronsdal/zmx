@@ -15,6 +15,7 @@ const pty = @import("pty.zig");
 const compat = @import("compat.zig");
 const paths = @import("paths.zig");
 const spawn = @import("spawn.zig");
+const shell = @import("shell.zig");
 const protocol = @import("protocol.zig");
 const input = @import("input.zig");
 const term_state = @import("term_state.zig");
@@ -24,6 +25,10 @@ const log = std.log.scoped(.daemon);
 
 /// Drop a client whose outbound framer backlog exceeds this.
 const client_backpressure_limit = 4 * 1024 * 1024;
+/// A leader whose backlog crosses this is demoted (kept connected). A client
+/// that isn't draining is one whose terminal is catatonic (half-open SSH,
+/// stuck pty master) — it must not keep driving the PTY's winsize.
+const leader_demote_backlog = 256 * 1024;
 /// Refuse new connections beyond this; protects against fd exhaustion from
 /// idle/leaked clients (each connection is same-uid, so this is anti-foot-gun
 /// not a security boundary).
@@ -218,21 +223,19 @@ const Daemon = struct {
         return null;
     }
 
-    /// No command running and nothing queued: a `.wait` can be answered now.
-    fn sessionIdle(self: *Daemon) bool {
-        return !self.session.cmd_running and self.session.run_queue.items.len == 0;
+    /// Make `c` the size-driving client and resize the PTY to match.
+    fn promoteLeader(self: *Daemon, c: *Client) void {
+        self.leader_id = c.id;
+        self.session.resize(c.rows, c.cols) catch {};
+        pty.setWinsize(self.pty_fd, .{ .rows = c.rows, .cols = c.cols }) catch {};
     }
 
-    /// Should the poll loop use a short timeout instead of blocking? True
-    /// when a typed request is awaiting `preexec` (300ms acceptance window)
-    /// or an untyped request is waiting for the shell's first prompt-ready
-    /// signal (5s/30s warn/fail).
-    fn needsTimeoutWake(self: *Daemon) bool {
-        for (self.session.run_queue.items) |r| {
-            if (r.sent and !r.accepted) return true;
-            if (!r.sent) return true;
+    fn removeWaiter(self: *Daemon, id: u32) void {
+        var i: usize = 0;
+        while (i < self.waiters.items.len) {
+            if (self.waiters.items[i] == id) _ = self.waiters.swapRemove(i) //
+            else i += 1;
         }
-        return false;
     }
 };
 
@@ -257,18 +260,15 @@ fn daemonMain(name: []const u8, initial_cmd: ?[]const []const u8) !void {
 
     // Redirect stderr to the session log, close stdin/stdout.
     {
-        var buf: [std.fs.max_path_bytes:0]u8 = undefined;
-        @memcpy(buf[0..sp.log.len], sp.log);
-        buf[sp.log.len] = 0;
-        const log_fd = try posix.openZ(
-            buf[0..sp.log.len :0],
+        const log_fd = try posix.open(
+            sp.log,
             .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true },
             0o600,
         );
         try posix.dup2(log_fd, posix.STDERR_FILENO);
         if (log_fd != posix.STDERR_FILENO) posix.close(log_fd);
 
-        const devnull = try posix.openZ("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+        const devnull = try posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
         try posix.dup2(devnull, posix.STDIN_FILENO);
         try posix.dup2(devnull, posix.STDOUT_FILENO);
         if (devnull > posix.STDERR_FILENO) posix.close(devnull);
@@ -380,7 +380,7 @@ fn runLoop(d: *Daemon) !void {
         }
 
         // 300ms timeout if a typed run is awaiting acceptance, else block.
-        const timeout: ?posix.timespec = if (d.needsTimeoutWake())
+        const timeout: ?posix.timespec = if (d.session.needsTimeoutWake())
             .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms }
         else
             null;
@@ -443,15 +443,20 @@ fn runLoop(d: *Daemon) !void {
                 // Broadcast to clients that want live output.
                 for (d.clients.items) |*c| {
                     if (c.wants_output and !c.closed) {
-                        if (c.framer.pendingWrite().len > client_backpressure_limit) {
+                        const backlog = c.framer.pendingWrite().len;
+                        if (backlog > client_backpressure_limit) {
                             log.warn("client {d} write backlog >4MiB; dropping", .{c.id});
                             c.closed = true;
                             continue;
                         }
-                        c.framer.queue(.output, data) catch |e| {
-                            log.warn("queue output to client {d}: {s}", .{ c.id, @errorName(e) });
-                            c.closed = true;
-                        };
+                        if (d.leader_id == c.id and backlog > leader_demote_backlog) {
+                            log.warn(
+                                "client {d} backlog >{d}KiB; demoting leader",
+                                .{ c.id, leader_demote_backlog / 1024 },
+                            );
+                            d.leader_id = null; // reapClosedClients re-elects
+                        }
+                        queueOrClose(c, .output, data);
                     }
                 }
                 routeCompletions(d);
@@ -509,6 +514,9 @@ fn runLoop(d: *Daemon) !void {
         if (d.session.checkAcceptanceTimeout(now)) {
             routeCompletions(d);
         }
+        // Hook-install timeout + completion routing.
+        d.session.checkHookTimeout(now);
+        routeHookCompletion(d);
         // Prompt-wait check (front run never typed because shell hasn't
         // reached its first prompt). Soft warn at 5s, hard fail at 30s.
         switch (d.session.checkPromptWait(now)) {
@@ -605,23 +613,37 @@ fn routeCompletions(d: *Daemon) void {
             .via = comp.result.via,
             .dur_ms = comp.result.dur_ms,
         };
-        c.framer.queue(.run_done, std.mem.asBytes(&wire)) catch {
-            c.closed = true;
-        };
+        queueOrClose(c, .run_done, std.mem.asBytes(&wire));
         c.wants_output = false;
         // This client just got its answer; if it had also issued `.wait` on
         // the same connection, drop it from waiters so drainWaiters below
         // doesn't send a second `.run_done`.
-        var wi: usize = 0;
-        while (wi < d.waiters.items.len) {
-            if (d.waiters.items[wi] == c.id) _ = d.waiters.swapRemove(wi) //
-            else wi += 1;
-        }
+        d.removeWaiter(c.id);
     }
     if (comps.len > 0) d.session.clearCompletions();
     // Any transition to idle (run completion, or interactive command's `done`)
     // releases blocked waiters.
-    if (d.sessionIdle()) drainWaiters(d);
+    if (d.session.isIdle()) drainWaiters(d);
+}
+
+fn routeHookCompletion(d: *Daemon) void {
+    const hc = d.session.takeHookCompletion() orelse return;
+    const c = d.findClient(hc.client_id) orelse return;
+    if (c.closed) return;
+    var b: [128]u8 = undefined;
+    switch (hc.result) {
+        .already_hooked => |v| queueOrClose(c, .ack, std.fmt.bufPrint(
+            &b,
+            "already hooked (v{d})",
+            .{v},
+        ) catch "already hooked"),
+        .installed => |sh| queueOrClose(c, .ack, std.fmt.bufPrint(
+            &b,
+            "installed → {s}/hook.{s}",
+            .{ shell.hook_dir, @tagName(sh) },
+        ) catch "installed"),
+        .err => |e| queueOrClose(c, .err, e),
+    }
 }
 
 fn waitReplyWire(d: *Daemon) ipc.RunDoneWire {
@@ -638,9 +660,7 @@ fn drainWaiters(d: *Daemon) void {
     for (d.waiters.items) |id| {
         const c = d.findClient(id) orelse continue;
         if (c.closed) continue;
-        c.framer.queue(.run_done, std.mem.asBytes(&wire)) catch {
-            c.closed = true;
-        };
+        queueOrClose(c, .run_done, std.mem.asBytes(&wire));
     }
     d.waiters.clearRetainingCapacity();
 }
@@ -657,14 +677,11 @@ fn reapClosedClients(d: *Daemon) void {
         flushClient(c);
         log.info("client {d} disconnected", .{c.id});
         if (d.leader_id == c.id) d.leader_id = null;
+        if (c.attached) d.session.attached_clients -= 1;
         // Don't execute commands queued by a now-dead client.
         d.session.cancelClientRuns(c.id);
-        // Drop from waiters.
-        var wi: usize = 0;
-        while (wi < d.waiters.items.len) {
-            if (d.waiters.items[wi] == c.id) _ = d.waiters.swapRemove(wi) //
-            else wi += 1;
-        }
+        d.session.cancelClientHook(c.id);
+        d.removeWaiter(c.id);
         // If this client owned an in-flight write, close the heredoc so the
         // shell returns to the prompt (body may be incomplete; base64 -d will
         // fail, but the session isn't wedged).
@@ -678,14 +695,19 @@ fn reapClosedClients(d: *Daemon) void {
         posix.close(c.fd);
         _ = d.clients.swapRemove(i);
     }
-    // Promote a new leader if the old one was reaped.
+    // Promote a new leader if the old one was reaped or demoted. Prefer a
+    // client that's actually draining; a backlog-demoted client must not be
+    // immediately re-elected.
     if (d.leader_id == null) {
+        var fallback: ?*Client = null;
         for (d.clients.items) |*nc| if (nc.attached and !nc.closed) {
-            d.leader_id = nc.id;
-            d.session.resize(nc.rows, nc.cols) catch {};
-            pty.setWinsize(d.pty_fd, .{ .rows = nc.rows, .cols = nc.cols }) catch {};
-            break;
+            if (nc.framer.pendingWrite().len <= leader_demote_backlog) {
+                fallback = nc;
+                break;
+            }
+            if (fallback == null) fallback = nc;
         };
+        if (fallback) |nc| d.promoteLeader(nc);
     }
 }
 
@@ -739,7 +761,7 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             // nested shell has announced either. `run` would hang forever
             // waiting for a prompt-ready signal that never comes.
             if ((d.spawned_shell == .unknown or d.session.unhookable) and
-                !d.session.hooked and !d.session.seen_prompt)
+                d.session.layers.len == 0 and !d.session.seen_prompt)
             {
                 try queueErr(
                     c,
@@ -755,8 +777,11 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
                 try c.framer.queue(.run_done, std.mem.asBytes(&w));
                 return;
             }
+            // First payload byte: 0 = normal, 1 = `-i`.
+            const interactive = msg.payload.len > 0 and msg.payload[0] == 1;
+            const cmd = if (msg.payload.len > 0) msg.payload[1..] else msg.payload;
             c.wants_output = true;
-            try d.session.queueRun(c.id, msg.payload);
+            try d.session.queueRun(c.id, cmd, interactive);
         },
         .send => {
             try d.session.queueSend(msg.payload);
@@ -765,7 +790,7 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
         .read => try handleRead(d, c, msg.payload),
         .info => try handleInfo(d, c),
         .wait => {
-            if (d.sessionIdle()) {
+            if (d.session.isIdle()) {
                 const wire = waitReplyWire(d);
                 try c.framer.queue(.run_done, std.mem.asBytes(&wire));
             } else {
@@ -785,6 +810,12 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             should_exit.store(true, .release);
         },
         .rename => try handleRename(d, c, msg.payload),
+        .hook => {
+            if (try d.session.startHook(c.id, std.time.nanoTimestamp())) |refusal| {
+                try c.framer.queue(.err, refusal);
+            }
+            // else: probe queued; completion routed via routeHookCompletion.
+        },
         .detach => {
             try c.framer.queue(.ack, "");
             // Empty payload: detach all attached clients (leader + followers).
@@ -801,13 +832,14 @@ fn handleAttach(d: *Daemon, c: *Client, payload: []const u8) !void {
     if (payload.len < 4) return queueErr(c, "attach: short payload", .{});
     c.cols = std.mem.readInt(u16, payload[0..2], .little);
     c.rows = std.mem.readInt(u16, payload[2..4], .little);
+    if (!c.attached) d.session.attached_clients += 1;
     c.attached = true;
     c.wants_output = true;
-    if (d.leader_id == null) {
-        d.leader_id = c.id;
-        try d.session.resize(c.rows, c.cols);
-        try pty.setWinsize(d.pty_fd, .{ .rows = c.rows, .cols = c.cols });
-    }
+    // The freshest attach is overwhelmingly the terminal a human is looking
+    // at; an existing leader may be a stale orphan (half-open SSH) holding
+    // the wrong winsize. Always promote — if the old leader is alive they
+    // re-promote on their next keystroke (handleInput).
+    d.promoteLeader(c);
 
     // Env refresh (#104): KEY=VAL\0KEY=VAL\0...
     spawn.refreshEnvLinks(d.sp.env_dir, payload[4..]) catch |err| {
@@ -830,11 +862,7 @@ fn handleInput(d: *Daemon, c: *Client, payload: []const u8) !void {
     }
     // Leader promotion on real user keystrokes (#135 fix: never drop, just
     // don't promote on terminal-generated reports).
-    if (r.user_input and d.leader_id != c.id) {
-        d.leader_id = c.id;
-        try d.session.resize(c.rows, c.cols);
-        pty.setWinsize(d.pty_fd, .{ .rows = c.rows, .cols = c.cols }) catch {};
-    }
+    if (r.user_input and d.leader_id != c.id) d.promoteLeader(c);
     try d.session.queueSend(payload);
 }
 
@@ -842,10 +870,9 @@ fn handleResize(d: *Daemon, c: *Client, payload: []const u8) !void {
     if (payload.len < 4) return queueErr(c, "resize: short payload", .{});
     c.cols = std.mem.readInt(u16, payload[0..2], .little);
     c.rows = std.mem.readInt(u16, payload[2..4], .little);
-    if (d.leader_id == c.id) {
-        try d.session.resize(c.rows, c.cols);
-        try pty.setWinsize(d.pty_fd, .{ .rows = c.rows, .cols = c.cols });
-    }
+    // Same best-effort swallow as promoteLeader: a ghostty resize OOM
+    // shouldn't drop the client (the PTY ioctl almost never fails).
+    if (d.leader_id == c.id) d.promoteLeader(c);
 }
 
 fn handleRead(d: *Daemon, c: *Client, payload: []const u8) !void {
@@ -890,31 +917,23 @@ fn handleInfo(d: *Daemon, c: *Client) !void {
 
     var buf: std.Io.Writer.Allocating = .init(d.gpa);
     defer buf.deinit();
-    var jw: std.json.Stringify = .{ .writer = &buf.writer };
-    try jw.beginObject();
-    try jw.objectField("name");
-    try jw.write(d.name);
-    try jw.objectField("pid");
-    try jw.write(@as(i32, @intCast(std.c.getpid())));
-    try jw.objectField("shell_pid");
-    try jw.write(d.shell_pid);
-    try jw.objectField("shell");
-    try jw.write(@tagName(d.session.shell));
-    try jw.objectField("hooked");
-    try jw.write(d.session.hooked);
-    try jw.objectField("cmd_running");
-    try jw.write(d.session.cmd_running);
-    try jw.objectField("alt_screen");
-    try jw.write(d.session.isAltScreen());
-    try jw.objectField("last_exit");
-    try jw.write(d.session.last_exit);
-    try jw.objectField("cwd");
-    try jw.write(d.session.lastCwd());
-    try jw.objectField("clients");
-    try jw.write(n_clients);
-    try jw.objectField("created");
-    try jw.write(d.created_ts);
-    try jw.endObject();
+    try std.json.Stringify.value(.{
+        .name = d.name,
+        .pid = @as(i32, @intCast(std.c.getpid())),
+        .shell_pid = d.shell_pid,
+        .shell = @tagName(d.session.topShell()),
+        .hooked = d.session.topHooked(),
+        .cmd_running = d.session.topCmdRunning(),
+        .depth = d.session.layers.len,
+        .alt_screen = d.session.isAltScreen(),
+        .mouse_tracking = d.session.mouseTracking(),
+        .osc133 = d.session.osc133Seen(),
+        .title = d.session.title(),
+        .last_exit = d.session.last_exit,
+        .cwd = d.session.lastCwd(),
+        .clients = n_clients,
+        .created = d.created_ts,
+    }, .{}, &buf.writer);
 
     try c.framer.queue(.info_reply, buf.writer.buffered());
 }
@@ -926,15 +945,16 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
         return queueErr(c, "write: path contains newline/NUL", .{});
     if (d.write_state != null)
         return queueErr(c, "write: another write in progress", .{});
-    if (d.session.cmd_running or d.session.run_queue.items.len > 0)
+    if (d.session.topCmdRunning() or d.session.run_queue.items.len > 0)
         return queueErr(c, "write: session busy", .{});
     if (d.session.isAltScreen())
         return queueErr(c, "write: session in alt-screen", .{});
-    if (!d.session.hooked and !d.session.seen_prompt)
+    if (d.session.layers.len == 0)
         return queueErr(c, "write: session not ready", .{});
     // Heredoc syntax is bash/zsh only.
-    if (d.session.shell == .fish or d.session.shell == .unknown)
-        return queueErr(c, "write: unsupported shell '{s}'", .{@tagName(d.session.shell)});
+    const sh = d.session.topShell();
+    if (sh == .fish or sh == .unknown)
+        return queueErr(c, "write: unsupported shell '{s}'", .{@tagName(sh)});
 
     var rnd: [4]u8 = undefined;
     std.crypto.random.bytes(&rnd);
@@ -943,7 +963,7 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
     ws.delim[10..18].* = std.fmt.bytesToHex(rnd, .lower);
     @memcpy(ws.delim[18..20], "__");
 
-    const quoted = try posixQuote(d.gpa, path);
+    const quoted = try shell.posixQuote(d.gpa, path);
     defer d.gpa.free(quoted);
 
     // One bracketed-paste enclosing the full heredoc (opener here, body via
@@ -1027,18 +1047,12 @@ fn handleRename(d: *Daemon, c: *Client, new_name: []const u8) !void {
 
 // ───────────────────────────── helpers ─────────────────────────────
 
-/// Wrap `s` in single quotes, encoding embedded `'` as `'\''`. Safe for
-/// bash/zsh word-splitting and expansion. Caller frees.
-fn posixQuote(allocator: Allocator, s: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.append(allocator, '\'');
-    for (s) |ch| {
-        if (ch == '\'') try out.appendSlice(allocator, "'\\''") //
-        else try out.append(allocator, ch);
-    }
-    try out.append(allocator, '\'');
-    return out.toOwnedSlice(allocator);
+/// Queue a frame, marking the client closed on failure (the only realistic
+/// failure is OOM, at which point dropping the client is the best option).
+fn queueOrClose(c: *Client, tag: ipc.Tag, payload: []const u8) void {
+    c.framer.queue(tag, payload) catch {
+        c.closed = true;
+    };
 }
 
 fn queueErr(c: *Client, comptime fmt: []const u8, args: anytype) !void {
@@ -1061,32 +1075,12 @@ fn queueChunked(c: *Client, tag: ipc.Tag, data: []const u8, chunk: usize) !void 
 
 /// Connect to `path` as a probe. Returns the connected fd if a daemon answers.
 fn probe(path: []const u8) ?posix.fd_t {
-    const fd = posix.socket(
-        posix.AF.UNIX,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-        0,
-    ) catch return null;
-
-    var addr = std.net.Address.initUnix(path) catch {
-        posix.close(fd);
-        return null;
-    };
-    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
-        posix.close(fd);
-        return null;
-    };
-    return fd;
+    const stream = std.net.connectUnixSocket(path) catch return null;
+    return stream.handle;
 }
 
 fn acquireLock(path: []const u8) !posix.fd_t {
-    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    const fd = try posix.openZ(
-        buf[0..path.len :0],
-        .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true },
-        0o600,
-    );
+    const fd = try posix.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
     errdefer posix.close(fd);
     try posix.flock(fd, posix.LOCK.EX | posix.LOCK.NB);
     return fd;
@@ -1149,24 +1143,6 @@ fn checkPeerUid(fd: posix.fd_t) bool {
     }
 }
 
-
-// ───────────────────────────── tests ─────────────────────────────
-
-const testing = std.testing;
-
-test "posixQuote" {
-    const q1 = try posixQuote(testing.allocator, "/tmp/a b");
-    defer testing.allocator.free(q1);
-    try testing.expectEqualStrings("'/tmp/a b'", q1);
-
-    const q2 = try posixQuote(testing.allocator, "it's");
-    defer testing.allocator.free(q2);
-    try testing.expectEqualStrings("'it'\\''s'", q2);
-
-    const q3 = try posixQuote(testing.allocator, "");
-    defer testing.allocator.free(q3);
-    try testing.expectEqualStrings("''", q3);
-}
 
 // Force analysis of the I/O glue so it at least type-checks.
 test {

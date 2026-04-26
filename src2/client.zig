@@ -10,46 +10,18 @@ const ipc = @import("ipc.zig");
 const paths = @import("paths.zig");
 const pty = @import("pty.zig");
 const compat = @import("compat.zig");
+const io = @import("io.zig");
 
 const daemon = @import("daemon.zig");
 
-const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+const writeAllFd = io.writeAllFd;
+const outf = io.outf;
+const errf = io.errf;
 
 const probe_connect_ms = 200;
 const probe_recv_timeout_us = 500_000;
 
-const env_forward = [_][:0]const u8{
-    "SSH_AUTH_SOCK", "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
-};
-
-// ---- tiny io helpers -----------------------------------------------------
-//
-// We deliberately avoid `std.fs.File.writer()` here: in Zig 0.15 it uses
-// positional `pwritev` starting at offset 0, which is fine for ttys/pipes but
-// overwrites the head of a regular file when stdout is redirected. Mixing
-// that with the sequential `posix.write` calls used for `.output` payloads
-// scrambles the output ordering. Format into a stack buffer and use the same
-// sequential write path for everything.
-
-fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) off += try posix.write(fd, bytes[off..]);
-}
-
-fn errf(comptime fmt: []const u8, args: anytype) void {
-    var buf: [1024]u8 = undefined;
-    // bufPrint fills buf to capacity before erroring, so `catch buf[0..]`
-    // would emit a valid (truncated) message — but with no trailing newline.
-    // Prefer an explicit marker so truncation is obvious.
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch "zmyth: <error message overflow>\n";
-    writeAllFd(posix.STDERR_FILENO, s) catch {};
-}
-
-fn outf(comptime fmt: []const u8, args: anytype) !void {
-    var buf: [1024]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, fmt, args);
-    try writeAllFd(posix.STDOUT_FILENO, s);
-}
+const env_forward = @import("shell.zig").env_forward;
 
 // ---- shared verb prologue ------------------------------------------------
 
@@ -198,8 +170,7 @@ fn probeAll(allocator: Allocator, names: []const []const u8) ![]Probe {
         if (re & (posix.POLL.ERR | posix.POLL.HUP) != 0) continue;
         posix.getsockoptError(fd) catch continue;
         // Flip back to blocking for the request/reply.
-        const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch continue;
-        _ = posix.fcntl(fd, posix.F.SETFL, flags & ~O_NONBLOCK) catch continue;
+        pty.setNonBlock(fd, false) catch continue;
         // Bound the wait so a wedged daemon can't hang `ls`.
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&recv_to)) catch {};
 
@@ -328,8 +299,7 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const ppoll_mask = try installSignals();
 
     // Make socket nonblocking for the Framer-driven pump.
-    const sf = try posix.fcntl(sock, posix.F.GETFL, 0);
-    _ = try posix.fcntl(sock, posix.F.SETFL, sf | O_NONBLOCK);
+    try pty.setNonBlock(sock, true);
 
     var framer = ipc.Framer.init(allocator);
     defer framer.deinit();
@@ -421,10 +391,12 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
 pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
     var detach_mode = false;
     var json_out = false;
+    var interactive = false;
     var i: usize = 0;
     while (i < args.len and args[i].len > 0 and args[i][0] == '-' and !std.mem.eql(u8, args[i], "--")) : (i += 1) {
         if (std.mem.eql(u8, args[i], "-d")) detach_mode = true //
         else if (std.mem.eql(u8, args[i], "-j")) json_out = true //
+        else if (std.mem.eql(u8, args[i], "-i")) interactive = true //
         else {
             errf("zmyth: run: unknown flag '{s}'\n", .{args[i]});
             return 2;
@@ -455,7 +427,12 @@ pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
     };
     defer posix.close(sock);
 
-    try ipc.sendBlocking(sock, .run, cmd);
+    // Wire payload: 1-byte interactive flag + cmd.
+    const payload = try allocator.alloc(u8, cmd.len + 1);
+    defer allocator.free(payload);
+    payload[0] = if (interactive) 1 else 0;
+    @memcpy(payload[1..], cmd);
+    try ipc.sendBlocking(sock, .run, payload);
     if (detach_mode) return 0;
 
     var got_err = false;
@@ -492,6 +469,55 @@ pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
                 got_err = true;
             },
             .eof => return if (got_err) 1 else 0,
+            else => {},
+        }
+    }
+}
+
+/// Install the shell-integration hook into the (possibly nested) shell that
+/// `name` is currently sitting at. With no `<name>`, prints the per-shell rc
+/// snippet for manual install instead.
+pub fn hook(allocator: Allocator, args: []const [:0]const u8) !u8 {
+    if (args.len == 0) {
+        const sh = @import("shell.zig");
+        try writeAllFd(
+            posix.STDOUT_FILENO,
+            "# zmyth hook — add ONE of these to the target shell's rc:\n\n" ++
+                "# bash (~/.bashrc):\n" ++ sh.rcSourceLine(.bash) ++ "\n\n" ++
+                "# zsh (~/.zshrc):\n" ++ sh.rcSourceLine(.zsh) ++ "\n\n" ++
+                "# fish (~/.config/fish/conf.d/zmyth.fish):\n" ++ sh.rcSourceLine(.fish) ++ "\n\n" ++
+                "# Or, with the session at the target shell's prompt:\n" ++
+                "#   zmyth hook <session>\n" ++
+                "# which writes " ++ sh.hook_dir ++ "/hook.<shell> and appends the line above.\n",
+        );
+        return 0;
+    }
+    const name = args[0];
+    if (validateNameOrFail(name, "hook")) |rc| return rc;
+
+    const sock = connectOrFail(allocator, name, "hook") orelse return 1;
+    defer posix.close(sock);
+    try ipc.sendBlocking(sock, .hook, "");
+
+    while (true) {
+        const msg = ipc.recvBlocking(allocator, sock) catch |err| switch (err) {
+            error.UnexpectedEof => {
+                errf("zmyth: hook: daemon closed connection\n", .{});
+                return 1;
+            },
+            else => return err,
+        };
+        defer allocator.free(msg.payload);
+        switch (msg.tag) {
+            .ack => {
+                try outf("zmyth: {s}\n", .{msg.payload});
+                return 0;
+            },
+            .err => {
+                errf("zmyth: {s}\n", .{msg.payload});
+                return 1;
+            },
+            .eof => return 1,
             else => {},
         }
     }

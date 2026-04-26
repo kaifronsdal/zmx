@@ -13,13 +13,7 @@ const protocol = @import("protocol.zig");
 
 const log = std.log.scoped(.spawn);
 
-/// Env keys whose values are refreshed (via symlink indirection) on each
-/// attach. See DESIGN.md #104.
-/// DISPLAY / DBUS_SESSION_BUS_ADDRESS are not filesystem paths; they need an env-reload mechanism (deferred).
-pub const refresh_env_keys = [_][]const u8{
-    "SSH_AUTH_SOCK",
-    "WAYLAND_DISPLAY",
-};
+const refresh_env_keys = @import("shell.zig").refresh_env_keys;
 
 pub const Spawned = struct {
     pid: posix.pid_t,
@@ -98,7 +92,7 @@ pub fn spawnShell(
         else => return e,
     };
 
-    const announce = "printf '\\033]2718;hello;{s}\\007'\n";
+    const announce = "printf '\\033]2718;hello;{s};%s\\007' \"$$\"\n";
 
     var argv: std.ArrayList([]const u8) = .empty;
     switch (shell) {
@@ -113,7 +107,7 @@ pub fn spawnShell(
                 arena,
                 "[ -f ~/.bashrc ] && . ~/.bashrc\n" ++
                     "if [ \"${{BASH_VERSINFO[0]:-0}}\" -ge 4 ]; then\n  " ++ announce ++
-                    "else\n  printf '\\033]2718;hello;bash-pre4\\007'\nfi\n",
+                    "else\n  printf '\\033]2718;hello;bash-pre4;%s\\007' \"$$\"\nfi\n",
                 .{"bash"},
             );
             try writeFile(rc, body);
@@ -156,7 +150,8 @@ pub fn spawnShell(
             // file: rc_dir derives from user-supplied ZMYTH_DIR and may
             // contain spaces/quotes, and fish word-splits -C's argument.
             try argv.appendSlice(arena, &.{
-                shell_path, "-i", "-C", "printf '\\033]2718;hello;fish\\007'",
+                shell_path, "-i", "-C",
+                "printf '\\033]2718;hello;fish;%s\\007' $fish_pid",
             });
         },
         .unknown => {
@@ -171,8 +166,8 @@ pub fn spawnShell(
 /// Parse a `KEY=VAL\0KEY=VAL\0...` blob and, for each key in
 /// `refresh_env_keys`, atomically repoint `<env_dir>/<KEY>` at `VAL`.
 pub fn refreshEnvLinks(env_dir: []const u8, kv_pairs: []const u8) !void {
-    var link_buf: [std.fs.max_path_bytes:0]u8 = undefined;
-    var tmp_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
 
     var it = std.mem.splitScalar(u8, kv_pairs, 0);
     while (it.next()) |pair| {
@@ -183,8 +178,8 @@ pub fn refreshEnvLinks(env_dir: []const u8, kv_pairs: []const u8) !void {
         for (refresh_env_keys) |k| {
             if (!std.mem.eql(u8, k, key)) continue;
             // Atomic symlink replace: link to <key>.tmp then rename.
-            const link = try std.fmt.bufPrintZ(&link_buf, "{s}/{s}", .{ env_dir, key });
-            const tmp = try std.fmt.bufPrintZ(&tmp_buf, "{s}/{s}.tmp", .{ env_dir, key });
+            const link = try std.fmt.bufPrint(&link_buf, "{s}/{s}", .{ env_dir, key });
+            const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}/{s}.tmp", .{ env_dir, key });
             posix.unlink(tmp) catch {};
             try posix.symlink(val, tmp);
             try posix.rename(tmp, link);
@@ -200,9 +195,11 @@ fn envKeyIs(entry: []const u8, key: []const u8) bool {
 }
 
 fn writeFile(path: []const u8, contents: []const u8) !void {
-    var f = try std.fs.createFileAbsolute(path, .{ .mode = 0o600 });
-    defer f.close();
-    try f.writeAll(contents);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = path,
+        .data = contents,
+        .flags = .{ .mode = 0o600 },
+    });
 }
 
 // ───────────────────────────── tests ─────────────────────────────

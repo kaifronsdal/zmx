@@ -10,6 +10,38 @@ const macos_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
 };
 
+/// Attach the ghostty-vt module to `mod`. `emit-lib-vt` skips ghostty's
+/// iOS-SDK probe so building on Linux without Xcode works.
+fn addGhosttyVt(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    if (b.lazyDependency("ghostty", .{
+        .@"emit-lib-vt" = true,
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+    }
+}
+
+/// One bash-driven integration test script that runs the installed `zmyth`.
+fn integrationTest(
+    b: *std.Build,
+    install_step: *std.Build.Step,
+    bin_path: []const u8,
+    script: []const u8,
+) *std.Build.Step.Run {
+    const t = b.addSystemCommand(&.{"bash"});
+    t.addFileArg(b.path(script));
+    t.setEnvironmentVariable("ZMYTH", bin_path);
+    t.has_side_effects = true; // never cache: spawns daemons, writes /tmp
+    t.step.dependOn(install_step);
+    return t;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -35,17 +67,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_mod.addOptions("build_options", options);
-
-    if (b.lazyDependency("ghostty", .{
-        .@"emit-lib-vt" = true,
-        .target = target,
-        .optimize = optimize,
-    })) |dep| {
-        exe_mod.addImport(
-            "ghostty-vt",
-            dep.module("ghostty-vt"),
-        );
-    }
+    addGhosttyVt(b, exe_mod, target, optimize);
 
     // Run
     {
@@ -70,19 +92,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        if (b.lazyDependency("ghostty", .{
-        .@"emit-lib-vt" = true,
-            .target = target,
-            .optimize = optimize,
-        })) |dep| {
-            test_module.addImport(
-                "ghostty-vt",
-                dep.module("ghostty-vt"),
-            );
-        }
-        const exe_unit_tests = b.addTest(.{
-            .root_module = test_module,
-        });
+        addGhosttyVt(b, test_module, target, optimize);
+        const exe_unit_tests = b.addTest(.{ .root_module = test_module });
         const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
         test_step.dependOn(&run_exe_unit_tests.step);
     }
@@ -95,13 +106,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         exe2_mod.addOptions("build_options", options);
-        if (b.lazyDependency("ghostty", .{
-        .@"emit-lib-vt" = true,
-            .target = target,
-            .optimize = optimize,
-        })) |dep| {
-            exe2_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
-        }
+        addGhosttyVt(b, exe2_mod, target, optimize);
+
         const exe2 = b.addExecutable(.{
             .name = "zmyth",
             .root_module = exe2_mod,
@@ -117,39 +123,37 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         test2_mod.addOptions("build_options", options);
-        if (b.lazyDependency("ghostty", .{
-        .@"emit-lib-vt" = true,
-            .target = target,
-            .optimize = optimize,
-        })) |dep| {
-            test2_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
-        }
+        addGhosttyVt(b, test2_mod, target, optimize);
         const test2 = b.addTest(.{ .root_module = test2_mod });
         test2.linkLibC();
         const run_test2 = b.addRunArtifact(test2);
         const test2_step = b.step("test2", "Run src2/ unit tests");
         test2_step.dependOn(&run_test2.step);
 
-        // Integration smoke tests: build zmyth, then drive it via bash.
+        // Integration tests: build zmyth, then drive it via bash.
         const install_exe2 = b.addInstallArtifact(exe2, .{});
-        const itest = b.addSystemCommand(&.{"bash"});
-        itest.addFileArg(b.path("test/integration/smoke.sh"));
-        itest.setEnvironmentVariable("ZMX", b.getInstallPath(.bin, "zmyth"));
-        itest.has_side_effects = true; // never cache: spawns daemons, uses /tmp
-        itest.step.dependOn(&install_exe2.step);
-        const itest_step = b.step("test-integration", "Build zmyth and run integration smoke tests");
-        itest_step.dependOn(&itest.step);
+        const bin_path = b.getInstallPath(.bin, "zmyth");
+
+        const itest_step = b.step("test-integration", "Build zmyth and run integration tests");
+        for ([_][]const u8{
+            "test/integration/smoke.sh",
+            "test/integration/hook_test.sh",
+            "test/integration/nested_test.sh",
+            "test/integration/headless_query.sh",
+        }) |script| {
+            itest_step.dependOn(&integrationTest(b, &install_exe2.step, bin_path, script).step);
+        }
 
         // Prompt-engine matrix: bash/zsh/fish × none/starship/oh-my-posh.
         // Separate step because it may download engine binaries on a fresh
         // host; not part of the default test-integration target.
-        const petest = b.addSystemCommand(&.{"bash"});
-        petest.addFileArg(b.path("test/integration/prompt_engines.sh"));
-        petest.setEnvironmentVariable("ZMX", b.getInstallPath(.bin, "zmyth"));
-        petest.has_side_effects = true;
-        petest.step.dependOn(&install_exe2.step);
         const petest_step = b.step("test-prompt-engines", "Build zmyth and run the prompt-engine integration matrix");
-        petest_step.dependOn(&petest.step);
+        petest_step.dependOn(&integrationTest(
+            b,
+            &install_exe2.step,
+            bin_path,
+            "test/integration/prompt_engines.sh",
+        ).step);
     }
 
     // Check for LSP integration
@@ -160,10 +164,6 @@ pub fn build(b: *std.Build) void {
             .root_module = exe_mod,
         });
         exe_check.linkLibC();
-
-        // Finally we add the "check" step which will be detected
-        // by ZLS and automatically enable Build-On-Save.
-        // If you copy this into your `build.zig`, make sure to rename 'foo'
         check.dependOn(&exe_check.step);
     }
 
@@ -184,14 +184,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseSafe,
             });
             release_mod.addOptions("build_options", options);
-
-            if (b.lazyDependency("ghostty", .{
-        .@"emit-lib-vt" = true,
-                .target = resolved,
-                .optimize = .ReleaseSafe,
-            })) |dep| {
-                release_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
-            }
+            addGhosttyVt(b, release_mod, resolved, .ReleaseSafe);
 
             const release_exe = b.addExecutable(.{
                 .name = "zmx",

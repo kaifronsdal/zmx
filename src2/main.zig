@@ -1,13 +1,16 @@
 const std = @import("std");
-const posix = std.posix;
 const build_options = @import("build_options");
 const client = @import("client.zig");
+const io = @import("io.zig");
+const outf = io.outf;
+const errf = io.errf;
 
 const usage =
     \\zmyth — minimal session manager
     \\
     \\  attach <name> [-- cmd...]             interactive (auto-create)
-    \\  run    [-d] [-j] <name> -- <cmd...>   run cmd, propagate exit code
+    \\  run    [-d] [-j] [-i] <name> -- <cmd...>   run cmd, propagate exit code
+    \\         -i: return when a nested prompt appears (e.g. ssh, docker exec)
     \\  send   <name> [- | <text>]            raw PTY input, no waiting
     \\  read   <name> [-f] [-s] [-n N] [--vt|--html]
     \\  write  <name> <path>                  stdin -> file inside session
@@ -15,6 +18,7 @@ const usage =
     \\  wait   <name|glob>... [-j]
     \\  kill   <name|glob>... [-9]
     \\  mv     <old> <new>
+    \\  hook   [<name>]                       install shell hook into nested shell
     \\  detach [<name>]
     \\  version | help | completions <shell>
     \\
@@ -42,6 +46,7 @@ pub fn main() !u8 {
     if (eq(verb, "wait")) return client.wait(allocator, rest);
     if (eq(verb, "kill")) return client.kill(allocator, rest);
     if (eq(verb, "mv") or eq(verb, "rename")) return client.mv(allocator, rest);
+    if (eq(verb, "hook")) return client.hook(allocator, rest);
     if (eq(verb, "detach")) return client.detach(allocator, rest);
 
     if (eq(verb, "version") or eq(verb, "--version") or eq(verb, "-V")) {
@@ -84,26 +89,4 @@ fn completions(args: []const [:0]const u8) !u8 {
 
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
-}
-
-// Avoid `std.fs.File.writer()`: in Zig 0.15 it flushes via positional pwritev
-// at offset 0, which clobbers the head of a regular file when stdout/stderr
-// are redirected with `>>`. Format into a stack buffer and use sequential
-// posix.write — same policy as client.zig.
-
-fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) off += try posix.write(fd, bytes[off..]);
-}
-
-fn outf(comptime fmt: []const u8, args: anytype) !void {
-    var buf: [1024]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, fmt, args);
-    try writeAllFd(posix.STDOUT_FILENO, s);
-}
-
-fn errf(comptime fmt: []const u8, args: anytype) void {
-    var buf: [1024]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
-    writeAllFd(posix.STDERR_FILENO, s) catch {};
 }
