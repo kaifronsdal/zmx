@@ -215,6 +215,8 @@ const Daemon = struct {
     /// Make `c` the size-driving client and resize the PTY to match.
     fn promoteLeader(self: *Daemon, c: *Client) void {
         self.leader_id = c.id;
+        // best-effort: ghostty resize can OOM and the PTY ioctl almost never
+        // fails — neither should cost the client its leader status.
         self.session.resize(c.rows, c.cols) catch {};
         pty.setWinsize(self.pty_fd, .{ .rows = c.rows, .cols = c.cols }) catch {};
     }
@@ -235,7 +237,7 @@ const Daemon = struct {
 fn daemonMain(name: []const u8, initial_cmd: ?[]const []const u8) !void {
     const gpa = std.heap.c_allocator;
 
-    // 1. Daemonize ─────────────────────────────────────────────────────
+    // ── daemonize ─────────────────────────────────────────────────────
     // First fork already happened in ensure(). Become session leader,
     // then fork again so we are not a session leader (and can't acquire
     // a controlling TTY by accident).
@@ -285,7 +287,7 @@ fn daemonMain(name: []const u8, initial_cmd: ?[]const []const u8) !void {
         else => return e,
     };
 
-    // 2. Spawn shell into a PTY ───────────────────────────────────────
+    // ── spawn shell into a PTY ───────────────────────────────────────
     const session = try Session.init(gpa, 24, 80);
 
     var p = try pty.Pty.open();
@@ -295,7 +297,7 @@ fn daemonMain(name: []const u8, initial_cmd: ?[]const []const u8) !void {
 
     const spawned = try spawn.spawnShell(gpa, &p, name, sp.rc_dir, sp.env_dir, initial_cmd);
 
-    // 3. Listen (lock held; safe to clear any stale socket file) ──────
+    // ── listen (lock held; safe to clear any stale socket file) ──────
     posix.unlink(sp.sock) catch {};
     const listen_fd = try listenUnix(sp.sock);
 
@@ -314,12 +316,12 @@ fn daemonMain(name: []const u8, initial_cmd: ?[]const []const u8) !void {
     };
     defer d.deinit();
 
-    // 5. Poll loop ────────────────────────────────────────────────────
+    // ── poll loop ────────────────────────────────────────────────────
     runLoop(&d) catch |err| {
         log.err("loop error: {s}", .{@errorName(err)});
     };
 
-    // 6. Cleanup ──────────────────────────────────────────────────────
+    // ── cleanup ──────────────────────────────────────────────────────
     log.info("shutting down session={s}", .{d.name});
     posix.close(d.listen_fd);
     posix.unlink(d.sp.sock) catch {};
@@ -402,67 +404,7 @@ fn runLoop(d: *Daemon) !void {
         }
 
         // ── pty_fd ───────────────────────────────────────────────────
-        const pty_re = d.pollfds.items[idx_pty].revents;
-        if (pty_re & posix.POLL.OUT != 0) {
-            const pending = d.session.pendingPtyInput();
-            if (pending.len > 0) {
-                const n = posix.write(d.pty_fd, pending) catch |err| switch (err) {
-                    error.WouldBlock => 0,
-                    else => blk: {
-                        log.warn("pty write: {s}", .{@errorName(err)});
-                        break :blk 0;
-                    },
-                };
-                d.session.consumePtyInput(n);
-            }
-        }
-        if (pty_re & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0) {
-            const n = posix.read(d.pty_fd, &read_buf) catch |err| switch (err) {
-                error.WouldBlock => @as(usize, std.math.maxInt(usize)), // sentinel: no data
-                // EIO on Linux when the slave end is closed.
-                error.InputOutput => 0,
-                else => 0,
-            };
-            if (n == 0) {
-                handlePtyEof(d);
-                break;
-            } else if (n != std.math.maxInt(usize)) {
-                const data = read_buf[0..n];
-                // Recount before each feed: a client whose backlog has crossed
-                // the demote threshold (catatonic terminal) won't relay query
-                // replies, so it doesn't count as "someone who'll answer."
-                d.session.attached_clients = blk: {
-                    var k: u32 = 0;
-                    for (d.clients.items) |*c| if (c.attached and !c.closed and
-                        c.framer.pendingWrite().len <= leader_demote_backlog)
-                    {
-                        k += 1;
-                    };
-                    break :blk k;
-                };
-                try d.session.feedPtyOutput(data);
-                // Broadcast to clients that want live output.
-                for (d.clients.items) |*c| {
-                    if (c.wants_output and !c.closed) {
-                        const backlog = c.framer.pendingWrite().len;
-                        if (backlog > client_backpressure_limit) {
-                            log.warn("client {d} write backlog >4MiB; dropping", .{c.id});
-                            c.closed = true;
-                            continue;
-                        }
-                        if (d.leader_id == c.id and backlog > leader_demote_backlog) {
-                            log.warn(
-                                "client {d} backlog >{d}KiB; demoting leader",
-                                .{ c.id, leader_demote_backlog / 1024 },
-                            );
-                            d.leader_id = null; // reapClosedClients re-elects
-                        }
-                        queueOrClose(c, .output, data);
-                    }
-                }
-                routeCompletions(d);
-            }
-        }
+        if (try servicePty(d, d.pollfds.items[idx_pty].revents, &read_buf)) break;
 
         // ── client fds ───────────────────────────────────────────────
         // Only iterate clients that existed when pollfds was built.
@@ -470,44 +412,8 @@ fn runLoop(d: *Daemon) !void {
         var i: usize = 0;
         while (i < polled) : (i += 1) {
             const c = &d.clients.items[i];
-            const re = d.pollfds.items[fixed_fds + i].revents;
             if (c.closed) continue;
-
-            if (re & posix.POLL.OUT != 0) {
-                flushClient(c);
-            }
-            if (re & posix.POLL.IN != 0) {
-                const rn = posix.read(c.fd, &read_buf) catch |err| switch (err) {
-                    error.WouldBlock => @as(usize, std.math.maxInt(usize)),
-                    else => 0,
-                };
-                if (rn == 0) {
-                    c.closed = true;
-                } else if (rn != std.math.maxInt(usize)) {
-                    c.framer.pushRead(read_buf[0..rn]) catch {
-                        c.closed = true;
-                        continue;
-                    };
-                    while (c.framer.next() catch blk: {
-                        c.closed = true;
-                        break :blk null;
-                    }) |msg| {
-                        dispatch(d, c, msg) catch |err| {
-                            log.warn("dispatch tag={d} client={d}: {s}", .{
-                                @intFromEnum(msg.tag), c.id, @errorName(err),
-                            });
-                            // Client is blocked expecting a reply; surface the
-                            // failure and hang up so it doesn't wait forever.
-                            queueErr(c, "internal: {s}", .{@errorName(err)}) catch {};
-                            c.closed = true;
-                        };
-                        if (c.closed) break;
-                    }
-                }
-            }
-            if (re & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
-                c.closed = true;
-            }
+            serviceClient(d, c, d.pollfds.items[fixed_fds + i].revents, &read_buf);
         }
 
         const now = std.time.nanoTimestamp();
@@ -544,6 +450,114 @@ fn runLoop(d: *Daemon) !void {
 
         reapChildren(d);
         reapClosedClients(d);
+    }
+}
+
+/// Non-blocking read: `null` on EAGAIN, `0` on EOF or error, else byte count.
+/// Folding errors into EOF lets the caller's close path handle both.
+fn readNb(fd: posix.fd_t, buf: []u8) ?usize {
+    return posix.read(fd, buf) catch |err| switch (err) {
+        error.WouldBlock => null,
+        // EIO on Linux when a PTY slave end is closed → treat as EOF.
+        error.InputOutput => 0,
+        else => 0,
+    };
+}
+
+/// Drain queued PTY input (POLLOUT), then read PTY output (POLLIN/HUP) and
+/// broadcast it. Returns true on PTY EOF — caller breaks the poll loop.
+fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
+    if (re & posix.POLL.OUT != 0) {
+        const pending = d.session.pendingPtyInput();
+        if (pending.len > 0) {
+            const n = posix.write(d.pty_fd, pending) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => blk: {
+                    log.warn("pty write: {s}", .{@errorName(err)});
+                    break :blk 0;
+                },
+            };
+            d.session.consumePtyInput(n);
+        }
+    }
+    if (re & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) return false;
+
+    const n = readNb(d.pty_fd, read_buf) orelse return false;
+    if (n == 0) {
+        handlePtyEof(d);
+        return true;
+    }
+    const data = read_buf[0..n];
+    // Recount before each feed: a client whose backlog has crossed the demote
+    // threshold (catatonic terminal) won't relay query replies, so it doesn't
+    // count as "someone who'll answer."
+    d.session.attached_clients = blk: {
+        var k: u32 = 0;
+        for (d.clients.items) |*c| if (c.attached and !c.closed and
+            c.framer.pendingWrite().len <= leader_demote_backlog)
+        {
+            k += 1;
+        };
+        break :blk k;
+    };
+    try d.session.feedPtyOutput(data);
+    // Broadcast to clients that want live output.
+    for (d.clients.items) |*c| {
+        if (c.wants_output and !c.closed) {
+            const backlog = c.framer.pendingWrite().len;
+            if (backlog > client_backpressure_limit) {
+                log.warn("client {d} write backlog >4MiB; dropping", .{c.id});
+                c.closed = true;
+                continue;
+            }
+            if (d.leader_id == c.id and backlog > leader_demote_backlog) {
+                log.warn(
+                    "client {d} backlog >{d}KiB; demoting leader",
+                    .{ c.id, leader_demote_backlog / 1024 },
+                );
+                d.leader_id = null; // reapClosedClients re-elects
+            }
+            queueOrClose(c, .output, data);
+        }
+    }
+    routeCompletions(d);
+    return false;
+}
+
+/// POLLOUT flush, POLLIN read+dispatch, HUP/ERR close.
+fn serviceClient(d: *Daemon, c: *Client, re: i16, read_buf: []u8) void {
+    if (re & posix.POLL.OUT != 0) {
+        flushClient(c);
+    }
+    if (re & posix.POLL.IN != 0) {
+        if (readNb(c.fd, read_buf)) |n| {
+            if (n == 0) {
+                c.closed = true;
+            } else {
+                c.framer.pushRead(read_buf[0..n]) catch {
+                    c.closed = true;
+                    return;
+                };
+                while (c.framer.next() catch blk: {
+                    c.closed = true;
+                    break :blk null;
+                }) |msg| {
+                    dispatch(d, c, msg) catch |err| {
+                        log.warn("dispatch tag={d} client={d}: {s}", .{
+                            @intFromEnum(msg.tag), c.id, @errorName(err),
+                        });
+                        // Client is blocked expecting a reply; surface the
+                        // failure and hang up so it doesn't wait forever.
+                        queueErr(c, "internal: {s}", .{@errorName(err)}) catch {};
+                        c.closed = true;
+                    };
+                    if (c.closed) break;
+                }
+            }
+        }
+    }
+    if (re & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+        c.closed = true;
     }
 }
 
@@ -818,7 +832,7 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
         },
         .detach => {
             try c.framer.queue(.ack, "");
-            // Empty payload: detach all attached clients (leader + followers).
+            // detach all attached clients (leader + followers); payload unused.
             for (d.clients.items) |*oc| if (oc.attached) {
                 oc.closed = true;
             };
@@ -1071,7 +1085,6 @@ fn queueChunked(c: *Client, tag: ipc.Tag, data: []const u8, chunk: usize) !void 
     if (data.len == 0) try c.framer.queue(tag, "");
 }
 
-
 /// Connect to `path` as a probe. Returns the connected fd if a daemon answers.
 fn probe(path: []const u8) ?posix.fd_t {
     const stream = std.net.connectUnixSocket(path) catch return null;
@@ -1141,7 +1154,6 @@ fn checkPeerUid(fd: posix.fd_t) bool {
         else => return true,
     }
 }
-
 
 // Force analysis of the I/O glue so it at least type-checks.
 test {
