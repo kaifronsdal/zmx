@@ -11,10 +11,10 @@ if not set -q __ZMYTH_HOOK_V; and set -q TERM; and test "$TERM" != dumb
     end
     set -l dur 0
     set -q CMD_DURATION; and set dur $CMD_DURATION
-    printf '\033]2718;done;%s;%d;%d;%s\007' $fish_pid $ec $dur $PWD
+    printf '\033]2718;done;%s;%d;%d;f;%s\007' $fish_pid $ec $dur $PWD
   end
   function __zmx_posterror --on-event fish_posterror
     set -g __ZMX_POSTERR 1
-    printf '\033]2718;done;%s;125;0;%s\007' $fish_pid $PWD
+    printf '\033]2718;done;%s;125;0;f;%s\007' $fish_pid $PWD
   end
 end

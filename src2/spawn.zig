@@ -92,25 +92,23 @@ pub fn spawnShell(
         else => return e,
     };
 
-    const announce = "printf '\\033]2718;hello;{s};%s\\007' \"$$\"\n";
+    // The rc-shim sources the user's rc, then the hook script itself —
+    // loaded *during* rc, not typed afterward, so there is no preexec/done
+    // for the daemon to swallow. Layer 0 announces via its first `done`
+    // (the hook's first precmd) exactly like a file-installed nested layer.
+    const sh = @import("shell.zig");
 
     var argv: std.ArrayList([]const u8) = .empty;
     switch (shell) {
         .bash => {
+            // bash <4 lacks bracketed-paste; the hook self-guards on
+            // BASH_VERSINFO so it's a no-op there → session is degraded
+            // (?2004h-only) and `run` falls back to .prompt_fallback.
             const rc = try std.fmt.allocPrint(arena, "{s}/bashrc", .{rc_dir});
-            // bash <4 (notably macOS /bin/bash = 3.2) lacks bracketed-paste:
-            // the verbatim-paste inject becomes literal `200~...201~` and
-            // `run`'s typed commands are mangled the same way. Announce as
-            // an unrecognised shell so the daemon refuses `run` cleanly
-            // instead of producing `200~true201~: command not found`.
-            const body = try std.fmt.allocPrint(
-                arena,
-                "[ -f ~/.bashrc ] && . ~/.bashrc\n" ++
-                    "if [ \"${{BASH_VERSINFO[0]:-0}}\" -ge 4 ]; then\n  " ++ announce ++
-                    "else\n  printf '\\033]2718;hello;bash-pre4;%s\\007' \"$$\"\nfi\n",
-                .{"bash"},
-            );
-            try writeFile(rc, body);
+            try writeFile(rc, try std.mem.concat(arena, u8, &.{
+                "[ -f ~/.bashrc ] && . ~/.bashrc\n",
+                sh.hookBody(.bash),
+            }));
             try argv.appendSlice(arena, &.{ shell_path, "--rcfile", rc, "-i" });
         },
         .zsh => {
@@ -123,42 +121,36 @@ pub fn spawnShell(
             const zenv = try std.fmt.allocPrint(arena, "{s}/.zshenv", .{rc_dir});
             // rc_dir derives from user-supplied $ZMYTH_DIR; quote it so a
             // `'` in the path can't break out of the assignment.
-            const rc_dir_q = try @import("shell.zig").posixQuote(arena, rc_dir);
-            const zenv_body = try std.fmt.allocPrint(
+            const rc_dir_q = try sh.posixQuote(arena, rc_dir);
+            try writeFile(zenv, try std.fmt.allocPrint(
                 arena,
                 "if [ -n \"$_ZMYTH_ORIG_ZDOTDIR\" ]; then export ZDOTDIR=\"$_ZMYTH_ORIG_ZDOTDIR\"; else unset ZDOTDIR; fi\n" ++
                     "[ -f \"${{ZDOTDIR:-$HOME}}/.zshenv\" ] && . \"${{ZDOTDIR:-$HOME}}/.zshenv\"\n" ++
                     "export _ZMYTH_USER_ZDOTDIR=\"${{ZDOTDIR-__unset__}}\"\n" ++
                     "export ZDOTDIR={s}\n",
                 .{rc_dir_q},
-            );
-            try writeFile(zenv, zenv_body);
+            ));
             const rc = try std.fmt.allocPrint(arena, "{s}/.zshrc", .{rc_dir});
-            const body = try std.fmt.allocPrint(
-                arena,
+            try writeFile(rc, try std.mem.concat(arena, u8, &.{
                 "if [ \"$_ZMYTH_USER_ZDOTDIR\" = __unset__ ]; then unset ZDOTDIR; " ++
                     "else export ZDOTDIR=\"$_ZMYTH_USER_ZDOTDIR\"; fi\n" ++
                     "unset _ZMYTH_USER_ZDOTDIR _ZMYTH_ORIG_ZDOTDIR\n" ++
-                    "[ -f \"${{ZDOTDIR:-$HOME}}/.zshrc\" ] && . \"${{ZDOTDIR:-$HOME}}/.zshrc\"\n" ++
-                    announce,
-                .{"zsh"},
-            );
-            try writeFile(rc, body);
+                    "[ -f \"${ZDOTDIR:-$HOME}/.zshrc\" ] && . \"${ZDOTDIR:-$HOME}/.zshrc\"\n",
+                sh.hookBody(.zsh),
+            }));
             try env.append(arena, try std.fmt.allocPrintSentinel(arena, "_ZMYTH_ORIG_ZDOTDIR={s}", .{orig_zdot}, 0));
             try env.append(arena, try std.fmt.allocPrintSentinel(arena, "ZDOTDIR={s}", .{rc_dir}, 0));
             try argv.appendSlice(arena, &.{ shell_path, "-i" });
         },
         .fish => {
-            // Pass the announce directly via -C rather than `source`-ing a
-            // file: rc_dir derives from user-supplied ZMYTH_DIR and may
-            // contain spaces/quotes, and fish word-splits -C's argument.
-            try argv.appendSlice(arena, &.{
-                shell_path, "-i", "-C",
-                "printf '\\033]2718;hello;fish;%s\\007' $fish_pid",
-            });
+            // -C runs *before* config.fish, but the hook only registers
+            // event handlers (--on-event) — order vs user config doesn't
+            // matter. Pass the body as the -C argument directly so rc_dir
+            // (which may contain spaces/quotes) never appears in fish source.
+            try argv.appendSlice(arena, &.{ shell_path, "-i", "-C", sh.hookBody(.fish) });
         },
         .unknown => {
-            log.warn("unknown shell '{s}'; spawning without announce hook", .{base});
+            log.warn("unknown shell '{s}'; spawning without hook", .{base});
             try argv.appendSlice(arena, &.{ shell_path, "-i" });
         },
     }

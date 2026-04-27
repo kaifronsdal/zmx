@@ -69,7 +69,7 @@ pub fn wrapPaste(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return std.mem.concat(allocator, u8, &.{ paste_open, s, paste_close });
 }
 
-/// Hook script body for `shell`. This is what `buildInject` pastes verbatim
+/// Hook script body for `shell`. Sourced directly by the rc shim at spawn,
 /// and what `buildInstall`'s `head -c` writes to the hook file.
 pub fn hookBody(shell: Shell) []const u8 {
     return switch (shell) {
@@ -78,13 +78,6 @@ pub fn hookBody(shell: Shell) []const u8 {
         .fish => hook_fish,
         .unknown => unreachable,
     };
-}
-
-/// Build the keystroke sequence to inject the hook for `shell` into a PTY.
-/// Hook scripts contain only printable bytes; the paste terminator `\e[201~`
-/// cannot occur in them. Caller frees.
-pub fn buildInject(allocator: std.mem.Allocator, shell: Shell) ![]u8 {
-    return wrapPaste(allocator, hookBody(shell));
 }
 
 /// One-line shell-detection probe, valid syntax in bash/zsh/fish. Non-shells
@@ -190,18 +183,6 @@ pub const refresh_env_keys = [_][]const u8{
 // ───────────────────────────── tests ─────────────────────────────
 
 const testing = std.testing;
-
-test "buildInject wraps script verbatim" {
-    inline for (.{ Shell.bash, Shell.zsh, Shell.fish }) |sh| {
-        const inj = try buildInject(testing.allocator, sh);
-        defer testing.allocator.free(inj);
-        try testing.expect(std.mem.startsWith(u8, inj, "\x15\x1b[200~"));
-        try testing.expect(std.mem.endsWith(u8, inj, "\x1b[201~\r"));
-        try testing.expect(std.mem.indexOf(u8, inj, "__ZMYTH_HOOK_V") != null);
-        // No external-binary dependency in the inject path.
-        try testing.expect(std.mem.indexOf(u8, inj, "base64") == null);
-    }
-}
 
 test "buildInstall: head -c N matches body length, body follows paste" {
     inline for (.{ Shell.bash, Shell.zsh, Shell.fish }) |sh| {

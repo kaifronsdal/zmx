@@ -773,7 +773,7 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             // (e.g. dash, or bash <4 which announces as `bash-pre4`), and no
             // nested shell has announced either. `run` would hang forever
             // waiting for a prompt-ready signal that never comes.
-            if ((d.spawned_shell == .unknown or d.session.unhookable) and
+            if (d.spawned_shell == .unknown and
                 d.session.layers.len == 0 and !d.session.seen_prompt)
             {
                 try queueErr(

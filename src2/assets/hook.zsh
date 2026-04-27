@@ -19,7 +19,7 @@ if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
     fi
     __ZMX_RAN=0
     __ZMX_T0=
-    printf '\033]2718;done;%s;%d;%d;%s\007' "$$" "$__zmx_ec" "$dur" "$PWD"
+    printf '\033]2718;done;%s;%d;%d;z;%s\007' "$$" "$__zmx_ec" "$dur" "$PWD"
   }
   autoload -Uz add-zsh-hook 2>/dev/null
   if typeset -f add-zsh-hook >/dev/null; then

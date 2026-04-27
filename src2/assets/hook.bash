@@ -1,4 +1,4 @@
-if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
+if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" && "${BASH_VERSINFO[0]:-0}" -ge 4 ]]; then
   __ZMYTH_HOOK_V=1
   __ZMX_T0=
   __ZMX_AT_PROMPT=
@@ -26,7 +26,7 @@ if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
     fi
     __ZMX_T0=
     __ZMX_IN_PC=
-    printf '\033]2718;done;%s;%d;%d;%s\007' "$$" "${__ZMX_EC:-$?}" "$dur" "$PWD"
+    printf '\033]2718;done;%s;%d;%d;b;%s\007' "$$" "${__ZMX_EC:-$?}" "$dur" "$PWD"
     __ZMX_AT_PROMPT=1
     return $__ZMX_EC
   }
