@@ -11,7 +11,15 @@
 //! There is no stdlib `File.printAll(fmt, args)` so this stays a small helper.
 
 const std = @import("std");
+const posix = std.posix;
 const File = std.fs.File;
+
+/// Set or clear O_NONBLOCK on `fd`. Works on any fd (sockets, PTYs, pipes).
+pub fn setNonBlock(fd: posix.fd_t, on: bool) !void {
+    const flags: usize = try posix.fcntl(fd, posix.F.GETFL, 0);
+    const nb: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+    _ = try posix.fcntl(fd, posix.F.SETFL, if (on) flags | nb else flags & ~nb);
+}
 
 pub fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
     return (File{ .handle = fd }).writeAll(bytes);

@@ -11,7 +11,7 @@
 
 const std = @import("std");
 
-pub const Shell = @import("protocol.zig").Shell;
+const Shell = @import("protocol.zig").Shell;
 
 // Hook scripts are bracketed-pasted verbatim into the interactive shell, so
 // they contain NO `#` comments: interactive zsh lacks INTERACTIVE_COMMENTS by

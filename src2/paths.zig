@@ -86,9 +86,8 @@ pub const SessionPaths = struct {
         defer allocator.free(sd);
 
         var self: SessionPaths = undefined;
-        self.sock = try std.fmt.allocPrint(allocator, "{s}/{s}.sock", .{ rt, name });
+        self.sock = try socketPath(allocator, name);
         errdefer allocator.free(self.sock);
-        try checkSockLen(self.sock);
         self.lock = try std.fmt.allocPrint(allocator, "{s}/{s}.lock", .{ rt, name });
         errdefer allocator.free(self.lock);
         self.rc_dir = try std.fmt.allocPrint(allocator, "{s}/{s}.rc", .{ rt, name });
@@ -255,8 +254,10 @@ test "validateName" {
     try validateName("a" ** 64);
 }
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+// Exposed so other test blocks (client.zig) can mutate ZMYTH_DIR without
+// re-declaring the externs.
+pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+pub extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "runtimeDir honours ZMYTH_DIR and creates 0700" {
     const alloc = testing.allocator;

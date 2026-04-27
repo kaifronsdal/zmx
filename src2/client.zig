@@ -17,6 +17,7 @@ const daemon = @import("daemon.zig");
 const writeAllFd = io.writeAllFd;
 const outf = io.outf;
 const errf = io.errf;
+const eq = std.mem.eql;
 
 const probe_connect_ms = 200;
 const probe_recv_timeout_us = 500_000;
@@ -102,7 +103,7 @@ fn resolveGlobs(allocator: Allocator, patterns: []const []const u8) ![][]const u
             matched = true;
             // dedupe
             var dup = false;
-            for (out.items) |o| if (std.mem.eql(u8, o, s)) {
+            for (out.items) |o| if (eq(u8, o, s)) {
                 dup = true;
                 break;
             };
@@ -162,7 +163,7 @@ fn probeAll(allocator: Allocator, names: []const []const u8) ![]Probe {
         if (re & (posix.POLL.ERR | posix.POLL.HUP) != 0) continue;
         posix.getsockoptError(fd) catch continue;
         // Flip back to blocking for the request/reply.
-        pty.setNonBlock(fd, false) catch continue;
+        io.setNonBlock(fd, false) catch continue;
         // Bound the wait so a wedged daemon can't hang `ls`.
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&recv_to)) catch {};
 
@@ -255,7 +256,7 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
 
     var initial_cmd: ?[]const []const u8 = null;
     if (args.len > 1) {
-        if (!std.mem.eql(u8, args[1], "--")) {
+        if (!eq(u8, args[1], "--")) {
             errf("zmyth: attach: expected '--' before command\n", .{});
             return 2;
         }
@@ -291,7 +292,7 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const ppoll_mask = try installSignals();
 
     // Make socket nonblocking for the Framer-driven pump.
-    try pty.setNonBlock(sock, true);
+    try io.setNonBlock(sock, true);
 
     var framer = ipc.Framer.init(allocator);
     defer framer.deinit();
@@ -385,10 +386,10 @@ pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
     var json_out = false;
     var interactive = false;
     var i: usize = 0;
-    while (i < args.len and args[i].len > 0 and args[i][0] == '-' and !std.mem.eql(u8, args[i], "--")) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "-d")) detach_mode = true //
-        else if (std.mem.eql(u8, args[i], "-j")) json_out = true //
-        else if (std.mem.eql(u8, args[i], "-i")) interactive = true //
+    while (i < args.len and args[i].len > 0 and args[i][0] == '-' and !eq(u8, args[i], "--")) : (i += 1) {
+        if (eq(u8, args[i], "-d")) detach_mode = true //
+        else if (eq(u8, args[i], "-j")) json_out = true //
+        else if (eq(u8, args[i], "-i")) interactive = true //
         else {
             errf("zmyth: run: unknown flag '{s}'\n", .{args[i]});
             return 2;
@@ -401,7 +402,7 @@ pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const name = args[i];
     i += 1;
     if (validateNameOrFail(name, "run")) |rc| return rc;
-    if (i >= args.len or !std.mem.eql(u8, args[i], "--")) {
+    if (i >= args.len or !eq(u8, args[i], "--")) {
         errf("zmyth: run: expected '--' before command\n", .{});
         return 2;
     }
@@ -526,7 +527,7 @@ pub fn send(allocator: Allocator, args: []const [:0]const u8) !u8 {
     var owned: ?[]u8 = null;
     defer if (owned) |o| allocator.free(o);
 
-    if (args.len == 2 and std.mem.eql(u8, args[1], "-")) {
+    if (args.len == 2 and eq(u8, args[1], "-")) {
         var buf: std.ArrayList(u8) = .empty;
         var tmp: [4096]u8 = undefined;
         while (true) {
@@ -561,11 +562,11 @@ pub fn read(allocator: Allocator, args: []const [:0]const u8) !u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "-f")) follow = true //
-        else if (std.mem.eql(u8, a, "-s")) screen = true //
-        else if (std.mem.eql(u8, a, "--vt")) fmt = 1 //
-        else if (std.mem.eql(u8, a, "--html")) fmt = 2 //
-        else if (std.mem.eql(u8, a, "-n")) {
+        if (eq(u8, a, "-f")) follow = true //
+        else if (eq(u8, a, "-s")) screen = true //
+        else if (eq(u8, a, "--vt")) fmt = 1 //
+        else if (eq(u8, a, "--html")) fmt = 2 //
+        else if (eq(u8, a, "-n")) {
             i += 1;
             if (i >= args.len) {
                 errf("zmyth: read: -n requires a number\n", .{});
@@ -636,8 +637,8 @@ pub fn ls(allocator: Allocator, args: []const [:0]const u8) !u8 {
     var quiet = false;
     var glob: []const u8 = "*";
     for (args) |a| {
-        if (std.mem.eql(u8, a, "-j")) json_out = true //
-        else if (std.mem.eql(u8, a, "-q")) quiet = true //
+        if (eq(u8, a, "-j")) json_out = true //
+        else if (eq(u8, a, "-q")) quiet = true //
         else if (a.len > 0 and a[0] == '-') {
             errf("zmyth: ls: unknown flag '{s}'\n", .{a});
             return 2;
@@ -652,8 +653,8 @@ pub fn ls(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const probes = try probeAll(allocator, names);
     defer freeProbes(allocator, probes);
 
-    // Format into memory then writeAllFd: see the note above writeAllFd for
-    // why File.stdout().writer() is unsafe with `>>` redirects.
+    // Format into memory then writeAllFd: see io.zig for why
+    // File.stdout().writer() is unsafe with `>>` redirects.
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     const w = &aw.writer;
@@ -698,7 +699,7 @@ pub fn wait(allocator: Allocator, args: []const [:0]const u8) !u8 {
     var pats: std.ArrayList([]const u8) = .empty;
     defer pats.deinit(allocator);
     for (args) |a| {
-        if (std.mem.eql(u8, a, "-j")) json_out = true //
+        if (eq(u8, a, "-j")) json_out = true //
         else if (a.len > 0 and a[0] == '-') {
             errf("zmyth: wait: unknown flag '{s}'\n", .{a});
             return 2;
@@ -829,7 +830,7 @@ pub fn kill(allocator: Allocator, args: []const [:0]const u8) !u8 {
     var pats: std.ArrayList([]const u8) = .empty;
     defer pats.deinit(allocator);
     for (args) |a| {
-        if (std.mem.eql(u8, a, "-9")) sig = @intCast(posix.SIG.KILL) //
+        if (eq(u8, a, "-9")) sig = @intCast(posix.SIG.KILL) //
         else if (a.len > 0 and a[0] == '-') {
             errf("zmyth: kill: unknown flag '{s}'\n", .{a});
             return 2;
@@ -913,8 +914,8 @@ pub fn detach(allocator: Allocator, args: []const [:0]const u8) !u8 {
 
 const testing = std.testing;
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+const setenv = paths.setenv;
+const unsetenv = paths.unsetenv;
 
 test "resolveGlobs dedupe + literal passthrough" {
     const tmp = "/tmp/zmx-client-test-globs";

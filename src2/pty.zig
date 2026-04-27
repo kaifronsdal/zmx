@@ -70,12 +70,9 @@ pub fn getWinsize(fd: posix.fd_t) !Winsize {
     return .{ .rows = kws.row, .cols = kws.col };
 }
 
-/// Set or clear O_NONBLOCK on `fd`.
-pub fn setNonBlock(fd: posix.fd_t, on: bool) !void {
-    const flags: usize = try posix.fcntl(fd, posix.F.GETFL, 0);
-    const nb: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
-    _ = try posix.fcntl(fd, posix.F.SETFL, if (on) flags | nb else flags & ~nb);
-}
+/// Re-export: daemon.zig still calls `pty.setNonBlock`; the impl lives in
+/// io.zig since it's used on sockets too, not just PTYs.
+pub const setNonBlock = @import("io.zig").setNonBlock;
 
 // ---- Pty -----------------------------------------------------------------
 
