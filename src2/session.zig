@@ -315,7 +315,7 @@ pub const Session = struct {
     }
 
     fn topDepth(self: *const Session) u8 {
-        return if (self.layers.len == 0) 0 else @intCast(self.layers.len - 1);
+        return if (self.layers.len == 0) 0 else self.layers.len - 1;
     }
 
     /// Index of `pid` in the stack, or null. pid==0 (degraded) only matches
@@ -820,7 +820,7 @@ pub const Session = struct {
         } });
     }
 
-    fn onProbe(self: *Session, p: @FieldType(protocol.Event, "probe")) !void {
+    fn onProbe(self: *Session, p: protocol.ProbeResult) !void {
         const hp = &(self.hook_pending orelse return);
         if (hp.phase != .probing) return;
 
@@ -916,6 +916,7 @@ pub const Session = struct {
 const testing = std.testing;
 
 const TPID: i32 = 100;
+const HELLO_BASH = std.fmt.comptimePrint("\x1b]2718;hello;bash;{d}\x07", .{TPID});
 
 fn doneOsc(buf: []u8, pid: i32, ec: i32, cwd: []const u8, dur: u64) []const u8 {
     return std.fmt.bufPrint(
@@ -931,7 +932,7 @@ fn preexecOsc(buf: []u8, pid: i32) []const u8 {
 
 /// Bring a fresh session to the hooked+idle state (hello, drain inject, done).
 fn hookAndIdle(s: *Session) !void {
-    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    try s.feedPtyOutput(HELLO_BASH);
     s.consumePtyInput(s.pendingPtyInput().len);
     var b: [128]u8 = undefined;
     try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
@@ -942,7 +943,7 @@ test "hello queues hook injection" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
 
-    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    try s.feedPtyOutput(HELLO_BASH);
     try testing.expectEqual(protocol.Shell.bash, s.topShell());
     try testing.expect(!s.topHooked());
 
@@ -956,7 +957,7 @@ test "first done sets hooked + last_exit" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
 
-    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    try s.feedPtyOutput(HELLO_BASH);
     s.consumePtyInput(s.pendingPtyInput().len);
 
     var b: [128]u8 = undefined;
@@ -989,7 +990,7 @@ test "queueRun while idle: type, preexec, done -> completion" {
     try testing.expectEqual(@as(usize, 1), comps.len);
     try testing.expectEqual(@as(u32, 1), comps[0].client_id);
     try testing.expectEqual(@as(?i32, 0), comps[0].result.exit_code);
-    try testing.expect(comps[0].result.via == .osc_done);
+    try testing.expectEqual(.osc_done, comps[0].result.via);
     try testing.expectEqual(@as(u64, 5), comps[0].result.dur_ms);
     try testing.expectEqual(@as(usize, 0), s.run_queue.items.len);
 }
@@ -1037,7 +1038,7 @@ test "prompt-fallback when not hooked" {
     try testing.expectEqual(@as(usize, 1), comps.len);
     try testing.expectEqual(@as(u32, 7), comps[0].client_id);
     try testing.expectEqual(@as(?i32, null), comps[0].result.exit_code);
-    try testing.expect(comps[0].result.via == .prompt_fallback);
+    try testing.expectEqual(.prompt_fallback, comps[0].result.via);
 }
 
 test "prompt ignored when hooked" {
@@ -1105,7 +1106,7 @@ test "checkAcceptanceTimeout sends ^C and rejects" {
     try testing.expect(std.mem.endsWith(u8, s.pendingPtyInput(), "\x03"));
     const comps = s.completions();
     try testing.expectEqual(@as(usize, 1), comps.len);
-    try testing.expect(comps[0].result.via == .line_rejected);
+    try testing.expectEqual(.line_rejected, comps[0].result.via);
     try testing.expectEqual(@as(?i32, null), comps[0].result.exit_code);
     try testing.expectEqual(@as(usize, 0), s.run_queue.items.len);
 }
@@ -1174,7 +1175,7 @@ test "onPtyEof completes all queued" {
     const comps = s.completions();
     try testing.expectEqual(@as(usize, 2), comps.len);
     try testing.expectEqual(@as(u32, 1), comps[0].client_id);
-    try testing.expect(comps[0].result.via == .pty_eof);
+    try testing.expectEqual(.pty_eof, comps[0].result.via);
     try testing.expectEqual(@as(?i32, 5), comps[0].result.exit_code);
     // Never-sent request: no exit code, zero duration.
     try testing.expectEqual(@as(u32, 2), comps[1].client_id);
@@ -1284,8 +1285,8 @@ test "two hellos before first done: second inject's echo not misattributed" {
 
     // Outer shell announces, then a nested shell announces before the outer
     // inject's done arrives.
-    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
-    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    try s.feedPtyOutput(HELLO_BASH);
+    try s.feedPtyOutput(HELLO_BASH);
     try testing.expectEqual(@as(u8, 2), s.top().?.inject_pending);
     s.consumePtyInput(s.pendingPtyInput().len);
 
@@ -1323,7 +1324,7 @@ test "stuck inject_echo_pending recovers after 5s" {
 
     // Nested shell hellos; we queue an inject and bump the counter — but the
     // shell dies before emitting `done`, so the counter never drains.
-    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    try s.feedPtyOutput(HELLO_BASH);
     s.consumePtyInput(s.pendingPtyInput().len);
     try testing.expectEqual(@as(u8, 1), s.top().?.inject_pending);
 
@@ -1332,7 +1333,7 @@ test "stuck inject_echo_pending recovers after 5s" {
     try testing.expect(!s.run_queue.items[0].sent); // wedged
 
     // Before 5s: still wedged, no warn (hooked gate would normally suppress).
-    try testing.expect(s.checkPromptWait(t0 + 2 * std.time.ns_per_s) == .none);
+    try testing.expectEqual(PromptWait.none, s.checkPromptWait(t0 + 2 * std.time.ns_per_s));
     try testing.expect(!s.run_queue.items[0].sent);
 
     // After 5s: recovery forces the counter to 0, types the request, warns.
@@ -1342,7 +1343,7 @@ test "stuck inject_echo_pending recovers after 5s" {
     try testing.expect(s.run_queue.items[0].sent);
 
     // Subsequent ticks are quiet.
-    try testing.expect(s.checkPromptWait(t0 + 7 * std.time.ns_per_s) == .none);
+    try testing.expectEqual(PromptWait.none, s.checkPromptWait(t0 + 7 * std.time.ns_per_s));
 }
 
 test "degraded->hooked transition does not ^C pre-hook request" {
@@ -1358,7 +1359,7 @@ test "degraded->hooked transition does not ^C pre-hook request" {
 
     // While that command runs, a nested shell announces and its inject's
     // `done` flips hooked=true.
-    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    try s.feedPtyOutput(HELLO_BASH);
     s.consumePtyInput(s.pendingPtyInput().len);
     var b: [128]u8 = undefined;
     try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
@@ -1402,7 +1403,7 @@ test "acceptance timeout adapts to observed preexec latency" {
     try testing.expectEqual(@as(usize, 0), s.completions().len);
     // Past the adaptive window: rejects.
     try testing.expect(s.checkAcceptanceTimeout(tf + window + 100 * std.time.ns_per_ms));
-    try testing.expect(s.completions()[0].result.via == .line_rejected);
+    try testing.expectEqual(.line_rejected, s.completions()[0].result.via);
 }
 
 test "checkPromptWait warns for request queued behind a running command" {
@@ -1424,13 +1425,13 @@ test "checkPromptWait warns for request queued behind a running command" {
     const t0 = s.run_queue.items[1].queued_ns;
 
     // Before 5s: silent.
-    try testing.expect(s.checkPromptWait(t0 + 2 * std.time.ns_per_s) == .none);
+    try testing.expectEqual(PromptWait.none, s.checkPromptWait(t0 + 2 * std.time.ns_per_s));
     // At 5s: warn fires for client 2 (not client 1 — front is sent).
     try testing.expectEqual(@as(u32, 2), s.checkPromptWait(t0 + 6 * std.time.ns_per_s).warn);
     // One-shot.
-    try testing.expect(s.checkPromptWait(t0 + 7 * std.time.ns_per_s) == .none);
+    try testing.expectEqual(PromptWait.none, s.checkPromptWait(t0 + 7 * std.time.ns_per_s));
     // No hard timeout even past 60s — previous command may run for hours.
-    try testing.expect(s.checkPromptWait(t0 + 90 * std.time.ns_per_s) == .none);
+    try testing.expectEqual(PromptWait.none, s.checkPromptWait(t0 + 90 * std.time.ns_per_s));
     try testing.expectEqual(@as(usize, 2), s.run_queue.items.len);
     try testing.expectEqual(@as(usize, 0), s.completions().len);
 }
@@ -1443,7 +1444,7 @@ test "startHook queues probe and arms" {
     try hookAndIdle(&s);
 
     try testing.expectEqual(@as(?[]const u8, null), try s.startHook(7, 0));
-    try testing.expect(s.hook_pending.?.phase == .probing);
+    try testing.expectEqual(.probing, s.hook_pending.?.phase);
     try testing.expect(std.mem.indexOf(u8, s.pendingPtyInput(), "$__ZMYTH_HOOK_V") != null);
     try testing.expect(s.takeHookCompletion() == null);
 }
@@ -1506,7 +1507,7 @@ test "hook: probe → install → done completes" {
     s.consumePtyInput(s.pendingPtyInput().len);
     // Remote (unhooked) shell emits probe OSC, no preexec/done bracket.
     try s.feedPtyOutput("\x1b]2718;probe;b=,z=5.9,f=,h=\x07");
-    try testing.expect(s.hook_pending.?.phase == .installing);
+    try testing.expectEqual(.installing, s.hook_pending.?.phase);
     // Install was queued: paste + body in one go.
     const inp = s.pendingPtyInput();
     try testing.expect(std.mem.indexOf(u8, inp, "head -c ") != null);
@@ -1576,7 +1577,7 @@ test "hook: install in already-hooked outer; outer's preexec/done swallowed" {
     // is when probe ran in outer (h=1, already_hooked) — covered above. This
     // test pins that a stray preexec during .installing doesn't misfire.
     try s.feedPtyOutput("\x1b]2718;probe;b=5.2,z=,f=,h=\x07");
-    try testing.expect(s.hook_pending.?.phase == .installing);
+    try testing.expectEqual(.installing, s.hook_pending.?.phase);
     s.consumePtyInput(s.pendingPtyInput().len);
     // Stray preexec (outer somehow): swallowed, paired done swallowed.
     try s.feedPtyOutput(preexecOsc(&b, TPID));
@@ -1629,7 +1630,7 @@ test "run -i: ?2004h after preexec → at_prompt + degraded layer pushed" {
     try s.feedPtyOutput("\x1b[?2004h");
     const c = s.completions();
     try testing.expectEqual(@as(usize, 1), c.len);
-    try testing.expect(c[0].result.via == .at_prompt);
+    try testing.expectEqual(.at_prompt, c[0].result.via);
     try testing.expectEqual(@as(?i32, 0), c[0].result.exit_code);
     try testing.expectEqual(@as(usize, 0), s.run_queue.items.len);
     // Degraded nested layer pushed.
@@ -1645,7 +1646,7 @@ test "run -i: ?2004h after preexec → at_prompt + degraded layer pushed" {
     try testing.expect(!s.run_queue.items[0].expect_preexec);
     // Unhooked top: ?2004h is the completion signal.
     try s.feedPtyOutput("\x1b[?2004h");
-    try testing.expect(s.completions()[0].result.via == .prompt_fallback);
+    try testing.expectEqual(.prompt_fallback, s.completions()[0].result.via);
 }
 
 test "run -i: done from new pid → at_prompt + hooked layer pushed" {
@@ -1660,7 +1661,7 @@ test "run -i: done from new pid → at_prompt + hooked layer pushed" {
 
     // Remote has a file-installed hook → first prompt emits done from new pid.
     try s.feedPtyOutput(doneOsc(&b, 555, 0, "/home/r", 0));
-    try testing.expect(s.completions()[0].result.via == .at_prompt);
+    try testing.expectEqual(.at_prompt, s.completions()[0].result.via);
     try testing.expectEqual(@as(u8, 2), s.layers.len);
     try testing.expectEqual(@as(i32, 555), s.top().?.pid);
     try testing.expect(s.topHooked());
@@ -1675,7 +1676,7 @@ test "run -i: done from new pid → at_prompt + hooked layer pushed" {
     try s.feedPtyOutput(preexecOsc(&b, 555));
     try s.feedPtyOutput(doneOsc(&b, 555, 7, "/home/r", 3));
     try testing.expectEqual(@as(?i32, 7), s.completions()[0].result.exit_code);
-    try testing.expect(s.completions()[0].result.via == .osc_done);
+    try testing.expectEqual(.osc_done, s.completions()[0].result.via);
 }
 
 test "run -i: command exits without nested prompt → osc_done (not at_prompt)" {
@@ -1690,7 +1691,7 @@ test "run -i: command exits without nested prompt → osc_done (not at_prompt)" 
     try s.feedPtyOutput(preexecOsc(&b, TPID));
     try s.feedPtyOutput(doneOsc(&b, TPID, 1, "/", 5));
     try testing.expectEqual(@as(?i32, 1), s.completions()[0].result.exit_code);
-    try testing.expect(s.completions()[0].result.via == .osc_done);
+    try testing.expectEqual(.osc_done, s.completions()[0].result.via);
     try testing.expectEqual(@as(u8, 1), s.layers.len);
 }
 
@@ -1720,7 +1721,7 @@ test "layer pop: done from below-top pid pops + completes dangling run" {
     const c = s.completions();
     try testing.expectEqual(@as(usize, 1), c.len);
     try testing.expectEqual(@as(u32, 2), c[0].client_id);
-    try testing.expect(c[0].result.via == .layer_exited);
+    try testing.expectEqual(.layer_exited, c[0].result.via);
     try testing.expectEqual(@as(?i32, 0), c[0].result.exit_code);
     try testing.expectEqual(@as(usize, 0), s.run_queue.items.len);
     try testing.expect(!s.topCmdRunning());
@@ -1761,7 +1762,7 @@ test "non-interactive run -- ssh: outer run survives nested layer push/pop" {
     try testing.expectEqual(@as(usize, 1), s.completions().len);
     try testing.expectEqual(@as(u32, 1), s.completions()[0].client_id);
     try testing.expectEqual(@as(?i32, 5), s.completions()[0].result.exit_code);
-    try testing.expect(s.completions()[0].result.via == .osc_done);
+    try testing.expectEqual(.osc_done, s.completions()[0].result.via);
 }
 
 test "degraded-top adoption: run -i ?2004h then hook installs → same layer" {
@@ -1916,19 +1917,19 @@ test "checkPromptWait: warn at 5s, timeout at 30s, none once ready" {
     const t0 = s.run_queue.items[0].queued_ns;
     try testing.expect(!s.run_queue.items[0].sent);
 
-    try testing.expect(s.checkPromptWait(t0 + 1 * std.time.ns_per_s) == .none);
+    try testing.expectEqual(PromptWait.none, s.checkPromptWait(t0 + 1 * std.time.ns_per_s));
     try testing.expectEqual(@as(u32, 7), s.checkPromptWait(t0 + 6 * std.time.ns_per_s).warn);
     // Warn fires once.
-    try testing.expect(s.checkPromptWait(t0 + 7 * std.time.ns_per_s) == .none);
+    try testing.expectEqual(PromptWait.none, s.checkPromptWait(t0 + 7 * std.time.ns_per_s));
     // Hard timeout completes the request.
     try testing.expectEqual(@as(u32, 7), s.checkPromptWait(t0 + 31 * std.time.ns_per_s).timeout);
     try testing.expectEqual(@as(usize, 0), s.run_queue.items.len);
     try testing.expectEqual(@as(usize, 1), s.completions().len);
-    try testing.expect(s.completions()[0].result.via == .prompt_fallback);
+    try testing.expectEqual(.prompt_fallback, s.completions()[0].result.via);
     s.clearCompletions();
 
     // Once the prompt-ready signal arrives, no more warns/timeouts.
     try s.feedPtyOutput("\x1b[?2004h");
     try s.queueRun(8, "echo hi", false);
-    try testing.expect(s.checkPromptWait(std.time.nanoTimestamp() + 60 * std.time.ns_per_s) == .none);
+    try testing.expectEqual(PromptWait.none, s.checkPromptWait(std.time.nanoTimestamp() + 60 * std.time.ns_per_s));
 }

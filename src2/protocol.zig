@@ -49,15 +49,19 @@ pub const Shell = enum {
     }
 };
 
+pub const Hello = struct { shell: Shell, pid: i32 };
+pub const Done = struct { pid: i32, exit_code: i32, cwd: []const u8, dur_ms: u64 };
+/// Response to `probe_line`. `shell` is whichever of b=/z=/f= was non-empty
+/// (`.unknown` if none — sh/dash/ksh ran the printf with all vars empty).
+/// `shell_major` is the leading integer of that shell's `*_VERSION`.
+/// `hook_v` is the reported `$__ZMYTH_HOOK_V` (0 if unset).
+pub const ProbeResult = struct { shell: Shell, shell_major: u32, hook_v: u32 };
+
 pub const Event = union(enum) {
-    hello: struct { shell: Shell, pid: i32 },
+    hello: Hello,
     preexec: i32, // pid
-    done: struct { pid: i32, exit_code: i32, cwd: []const u8, dur_ms: u64 },
-    /// Response to `probe_line`. `shell` is whichever of b=/z=/f= was non-empty
-    /// (`.unknown` if none — sh/dash/ksh ran the printf with all vars empty).
-    /// `shell_major` is the leading integer of that shell's `*_VERSION`.
-    /// `hook_v` is the reported `$__ZMYTH_HOOK_V` (0 if unset).
-    probe: struct { shell: Shell, shell_major: u32, hook_v: u32 },
+    done: Done,
+    probe: ProbeResult,
     /// CSI ?2004h (bracketed-paste on) — shell is back at the prompt
     prompt,
     /// OSC 7 `file://<host>/<path>`: shell-reported cwd. Path component only,
@@ -234,8 +238,8 @@ pub const Scanner = struct {
 };
 
 /// `b=5.2.21(1)-release,z=,f=,h=1` → which shell + its major version + hook_v.
-fn parseProbe(body: []const u8) @FieldType(Event, "probe") {
-    var r: @FieldType(Event, "probe") = .{ .shell = .unknown, .shell_major = 0, .hook_v = 0 };
+fn parseProbe(body: []const u8) ProbeResult {
+    var r: ProbeResult = .{ .shell = .unknown, .shell_major = 0, .hook_v = 0 };
     var it = std.mem.splitScalar(u8, body, ',');
     while (it.next()) |kv| {
         if (kv.len < 2 or kv[1] != '=') continue;
