@@ -21,7 +21,7 @@ pub const Tag = enum(u8) {
     run, //        u8 interactive (0/1), then command string
     send, //       raw bytes for PTY
     read, //       u8 mode (0=scrollback,1=screen,2=follow), u32 tail_n
-    write_hdr, //  target path string
+    write_hdr, //  u64 encoded-body length, then target path string
     write_data, // chunk of base64; empty = EOF
     info, //       (empty)
     wait, //       (empty)

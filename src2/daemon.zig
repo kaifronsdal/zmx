@@ -36,6 +36,9 @@ const max_clients = 64;
 const state_chunk = 256 * 1024;
 /// Max payload per `.data` frame sent for `read`.
 const data_chunk = 64 * 1024;
+/// `.write_data` ack is deferred while pty_input is above this, so the client
+/// can't push faster than the PTY drains.
+const write_backpressure = 256 * 1024;
 
 // ───────────────────────────── public API ─────────────────────────────
 
@@ -142,6 +145,9 @@ const Client = struct {
     wants_output: bool = false,
     /// Blocked in `.wait`; receives `.run_done` once the session is idle.
     waiting: bool = false,
+    /// `.write_data` chunk received while pty_input was over the backpressure
+    /// threshold; `.ack` is deferred until servicePty drains it.
+    write_ack_pending: bool = false,
     closed: bool = false,
     /// Last reported terminal size from this client (for leader promotion).
     rows: u16 = 24,
@@ -455,6 +461,7 @@ fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
             };
             d.session.consumePtyInput(n);
         }
+        releaseWriteAck(d);
     }
     if (re & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) == 0) return false;
 
@@ -477,6 +484,7 @@ fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
         break :blk k;
     };
     try d.session.feedPtyOutput(data);
+    releaseWriteAck(d);
     // Broadcast to clients that want live output.
     for (d.clients.items) |*c| {
         if (c.wants_output and !c.closed) {
@@ -665,11 +673,12 @@ fn reapClosedClients(d: *Daemon) void {
         // Don't execute commands queued by a now-dead client.
         d.session.cancelClientRuns(c.id);
         d.session.cancelClientHook(c.id);
-        // If this client owned an in-flight write, close the heredoc so the
-        // shell returns to the prompt (body may be incomplete; base64 -d will
-        // fail, but the session isn't wedged).
+        // If this client owned an in-flight write, ^C so the shell returns
+        // to the prompt (head -c N would otherwise wait for the missing
+        // bytes; base64 -d will leave a partial file but the session isn't
+        // wedged).
         if (d.write_client == c.id) {
-            d.session.queueSend(shell.write_closer) catch {};
+            d.session.queueSend("\x03") catch {};
             d.write_client = null;
         }
         c.framer.deinit();
@@ -900,7 +909,10 @@ fn handleInfo(d: *Daemon, c: *Client) !void {
     try c.framer.queue(.info_reply, buf.writer.buffered());
 }
 
-fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
+fn handleWriteHdr(d: *Daemon, c: *Client, payload: []const u8) !void {
+    if (payload.len < 8) return queueErr(c, "write: short header", .{});
+    const enc_len = std.mem.readInt(u64, payload[0..8], .little);
+    const path = payload[8..];
     if (path.len == 0 or path.len >= 4096)
         return queueErr(c, "write: invalid path length", .{});
     // ESC would let the path terminate the bracketed-paste wrapper early.
@@ -908,35 +920,55 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
         return queueErr(c, "write: path contains control character", .{});
     if (d.write_client != null)
         return queueErr(c, "write: another write in progress", .{});
-    if (d.session.topCmdRunning() or d.session.run_queue.items.len > 0)
+    if (d.session.run_queue.items.len > 0)
         return queueErr(c, "write: session busy", .{});
-    if (d.session.isAltScreen())
-        return queueErr(c, "write: session in alt-screen", .{});
-    if (d.session.layers.len == 0)
+    if (!d.session.canType())
         return queueErr(c, "write: session not ready", .{});
-    // Heredoc syntax is bash/zsh only.
-    const sh = d.session.topShell();
-    if (sh == .fish or sh == .unknown)
-        return queueErr(c, "write: unsupported shell '{s}'", .{@tagName(sh)});
+    // Body is delivered to head's stdin, not the line editor — that
+    // handoff is signalled by `preexec`, which only a hooked layer emits.
+    if (!d.session.topHooked())
+        return queueErr(c, "write: requires shell integration", .{});
 
-    const opener = try shell.writeOpener(d.gpa, path);
+    const opener = try shell.writeOpener(d.gpa, path, enc_len);
     defer d.gpa.free(opener);
     try d.session.queueSend(opener);
 
     d.write_client = c.id;
-    try c.framer.queue(.ack, "");
+    // Defer the hdr ack until `preexec` arrives. The line editor over-reads
+    // whatever is in the kernel PTY buffer when it accepts the command, so
+    // body bytes written before that are eaten or mistranslated. preexec is
+    // the positive signal that the editor has handed the tty to head.
+    c.write_ack_pending = true;
 }
 
 fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
     if (d.write_client != c.id) return queueErr(c, "write: no write in progress", .{});
-    if (payload.len > 0) {
-        try d.session.queueSend(payload);
+    if (payload.len == 0) {
+        d.write_client = null;
+        try c.framer.queue(.ack, "");
         return;
     }
-    // Empty payload = EOF: close heredoc, end paste, submit.
-    try d.session.queueSend(shell.write_closer);
-    d.write_client = null;
-    try c.framer.queue(.ack, "");
+    try d.session.queueSend(payload);
+    // Per-chunk ack is the backpressure signal: deferred while pty_input is
+    // backed up so the client (which blocks on recv) can't outrun the PTY.
+    if (d.session.pendingPtyInput().len < write_backpressure)
+        try c.framer.queue(.ack, "")
+    else
+        c.write_ack_pending = true;
+}
+
+/// Send a deferred `.write_hdr`/`.write_data` ack once it's safe: the opener
+/// has been accepted (`cmd_running` — base64 owns the tty) and pty_input has
+/// room. Called after both PTY drain (room may have opened) and PTY read
+/// (preexec may have arrived).
+fn releaseWriteAck(d: *Daemon) void {
+    const id = d.write_client orelse return;
+    if (!d.session.topCmdRunning()) return;
+    if (d.session.pendingPtyInput().len >= write_backpressure) return;
+    if (d.findClient(id)) |wc| if (wc.write_ack_pending) {
+        wc.write_ack_pending = false;
+        queueOrClose(wc, .ack, "");
+    };
 }
 
 // ───────────────────────────── helpers ─────────────────────────────

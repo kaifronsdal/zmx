@@ -24,7 +24,8 @@ const eq = std.mem.eql;
 const probe_connect_ms = 100;
 const probe_recv_timeout_us = 100_000;
 
-const env_forward = @import("shell.zig").env_forward;
+const sh = @import("shell.zig");
+const env_forward = sh.env_forward;
 
 // ---- shared verb prologue ------------------------------------------------
 
@@ -475,7 +476,6 @@ pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
 /// snippet for manual install instead.
 pub fn hook(allocator: Allocator, args: []const [:0]const u8) !u8 {
     if (args.len == 0) {
-        const sh = @import("shell.zig");
         try writeAllFd(
             posix.STDOUT_FILENO,
             "# zmyth hook — add ONE of these to the target shell's rc:\n\n" ++
@@ -766,6 +766,17 @@ pub fn wait(allocator: Allocator, args: []const [:0]const u8) !u8 {
     return agg;
 }
 
+/// read() until `buf` is full or EOF; returns bytes read.
+fn fillRead(fd: posix.fd_t, buf: []u8) !usize {
+    var n: usize = 0;
+    while (n < buf.len) {
+        const r = try posix.read(fd, buf[n..]);
+        if (r == 0) break;
+        n += r;
+    }
+    return n;
+}
+
 pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
     if (args.len < 2) {
         errf("zmyth: write: expected <name> <path>\n", .{});
@@ -775,10 +786,40 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const path = args[1];
     if (validateNameOrFail(name, "write")) |rc| return rc;
 
+    // The daemon types `head -c N`, so it needs the encoded length up front.
+    // For a regular-file stdin we stat; for a pipe we have to buffer (capped).
+    const stdin = posix.STDIN_FILENO;
+    var pipe_buf: ?[]u8 = null;
+    defer if (pipe_buf) |b| allocator.free(b);
+    const raw_len: u64 = blk: {
+        const st = try posix.fstat(stdin);
+        if (posix.S.ISREG(st.mode)) break :blk @intCast(st.size);
+        const cap = 64 * 1024 * 1024;
+        var b = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
+        var tmp: [64 * 1024]u8 = undefined;
+        while (true) {
+            const r = try posix.read(stdin, &tmp);
+            if (r == 0) break;
+            if (b.items.len + r > cap) {
+                b.deinit(allocator);
+                errf("zmyth: write: piped stdin exceeds {d}MB; redirect from a file instead\n", .{cap >> 20});
+                return 1;
+            }
+            try b.appendSlice(allocator, tmp[0..r]);
+        }
+        pipe_buf = try b.toOwnedSlice(allocator);
+        break :blk pipe_buf.?.len;
+    };
+    const enc_len = sh.writeEncLen(raw_len);
+
     const sock = connectOrFail(allocator, name, "write") orelse return 1;
     defer posix.close(sock);
 
-    try ipc.sendBlocking(sock, .write_hdr, path);
+    var hdr: std.ArrayList(u8) = .empty;
+    defer hdr.deinit(allocator);
+    try hdr.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u64, enc_len)));
+    try hdr.appendSlice(allocator, path);
+    try ipc.sendBlocking(sock, .write_hdr, hdr.items);
     {
         const reply = try ipc.recvBlocking(allocator, sock);
         defer allocator.free(reply.payload);
@@ -789,31 +830,45 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
         if (reply.tag != .ack) return 1;
     }
 
-    // Stream stdin -> base64 lines -> .write_data. Only complete 48-byte
+    // Stream raw → base64 lines → .write_data, one ack per chunk (the ack
+    // is the daemon's backpressure signal — it defers while pty_input is
+    // backed up). 48 raw → 64 enc + '\n' per line; only complete 48-byte
     // groups are encoded mid-stream so no `=` padding appears before EOF.
-    var raw: [48 * 256]u8 = undefined;
-    var held: usize = 0;
-    var enc: std.ArrayList(u8) = .empty;
-    defer enc.deinit(allocator);
-    while (true) {
-        const n = try posix.read(posix.STDIN_FILENO, raw[held..]);
-        const total = held + n;
-        const eof = n == 0;
-        const emit_end: usize = if (eof) total else (total / 48) * 48;
-
-        enc.clearRetainingCapacity();
-        var off: usize = 0;
-        while (off < emit_end) : (off += 48) {
-            var line: [68]u8 = undefined;
-            const e = std.base64.standard.Encoder.encode(&line, raw[off..@min(off + 48, emit_end)]);
-            try enc.appendSlice(allocator, e);
-            try enc.append(allocator, '\n');
+    var raw: [48 * 1024]u8 = undefined;
+    var enc: [65 * 1024]u8 = undefined;
+    var pos: u64 = 0;
+    while (pos < raw_len) {
+        const want: usize = @intCast(@min(raw.len, raw_len - pos));
+        const got = if (pipe_buf) |b| blk: {
+            @memcpy(raw[0..want], b[@intCast(pos)..][0..want]);
+            break :blk want;
+        } else try fillRead(stdin, raw[0..want]);
+        if (got < want) {
+            errf("zmyth: write: stdin shrank (got {d} of {d})\n", .{ pos + got, raw_len });
+            return 1;
         }
-        if (enc.items.len > 0) try ipc.sendBlocking(sock, .write_data, enc.items);
+        pos += got;
+        const last = pos == raw_len;
 
-        if (eof) break;
-        held = total - emit_end;
-        std.mem.copyForwards(u8, raw[0..held], raw[emit_end..total]);
+        var w: usize = 0;
+        var off: usize = 0;
+        while (off < got) : (off += 48) {
+            const e = std.base64.standard.Encoder.encode(enc[w..], raw[off..@min(off + 48, got)]);
+            w += e.len;
+            enc[w] = '\n';
+            w += 1;
+        }
+        // The last short group encodes with '=' padding; mid-stream chunks
+        // are 48-aligned (want is a multiple of 48 unless it's the tail).
+        std.debug.assert(last or got % 48 == 0);
+
+        try ipc.sendBlocking(sock, .write_data, enc[0..w]);
+        const ack = try ipc.recvBlocking(allocator, sock);
+        defer allocator.free(ack.payload);
+        if (ack.tag != .ack) {
+            if (ack.tag == .err) errf("zmyth: write: {s}\n", .{ack.payload});
+            return 1;
+        }
     }
 
     try ipc.sendBlocking(sock, .write_data, "");

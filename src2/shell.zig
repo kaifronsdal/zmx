@@ -149,27 +149,47 @@ pub fn buildInstall(allocator: std.mem.Allocator, shell: Shell) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-// ───────────────────── `zmyth write` heredoc ─────────────────────
+// ───────────────────── `zmyth write` ─────────────────────
 //
-// One bracketed-paste enclosing a base64 heredoc: opener here, body streamed
-// chunk-by-chunk, then `write_closer`. The body is base64 so it cannot contain
-// the delimiter on its own line — no per-write random nonce needed. bash/zsh
-// only (fish has no heredoc; the streaming-without-known-length constraint
-// rules out `head -c N` here).
+// A short bracketed-paste runs `head -c N | tr | base64 -d > path`; the
+// base64 body is streamed *after* the paste so `head` reads it directly
+// from the tty. Compared to a heredoc-inside-paste this is ~60× faster
+// (readline only buffers the ~80-byte command, not the whole body) and
+// needs no heredoc syntax, so it works in fish too.
+//
+// `head -c N` (length-prefixed) rather than `^D`-terminated: bytes that
+// land in the kernel input queue while the line editor is still in raw
+// mode are *not* reprocessed when the tty flips to cooked, so a `^D` sent
+// too early is delivered as literal 0x04. `head -c N` reads exactly N
+// bytes regardless of mode. `tr '\r' '\n'` normalises any NL/CR mangling
+// from the same raw→cooked transition (zle's INLCR). The daemon defers
+// the `.write_hdr` ack until `preexec` so the body is never written into
+// the same kernel-buffer-full as the command itself (line editors over-
+// read whatever is available).
 
-const write_eof = "__ZMYTH_EOF__";
-pub const write_closer = "\n" ++ write_eof ++ paste_close;
-
-/// `^U \e[200~ base64 -d > 'path' << 'EOF'\n`. Caller streams base64 lines
-/// then `write_closer`. Caller frees.
-pub fn writeOpener(allocator: Allocator, path: []const u8) ![]u8 {
+/// `^U ⟨paste⟩stty -echo; head -c N | tr '\r' '\n' | base64 -d > 'path'; stty
+/// echo⟨/paste⟩\r`. `n` is the byte length of the encoded body (incl. `\n`
+/// per line). Caller then streams exactly `n` bytes. Caller frees.
+pub fn writeOpener(allocator: Allocator, path: []const u8, n: u64) ![]u8 {
     const q = try posixQuote(allocator, path);
     defer allocator.free(q);
     return std.fmt.allocPrint(
         allocator,
-        paste_open ++ "base64 -d > {s} << '" ++ write_eof ++ "'\n",
-        .{q},
+        paste_open ++
+            "stty -echo; head -c {d} | tr '\\r' '\\n' | base64 -d > {s}; stty echo" ++
+            paste_close,
+        .{ n, q },
     );
+}
+
+/// Encoded body length for `raw_len` input bytes, given the client's
+/// 48-byte→64-char+`\n` line framing.
+pub fn writeEncLen(raw_len: u64) u64 {
+    const full = raw_len / 48;
+    const rem = raw_len % 48;
+    var n = full * 65;
+    if (rem > 0) n += ((rem + 2) / 3) * 4 + 1;
+    return n;
 }
 
 /// Wrap `s` in single quotes, encoding embedded `'` as `'\''`. Safe for

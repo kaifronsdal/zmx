@@ -833,7 +833,7 @@ pub const Session = struct {
     }
 
     /// Can a queued command be typed into the top layer right now?
-    fn canType(self: *Session) bool {
+    pub fn canType(self: *Session) bool {
         if (self.isAltScreen()) return false;
         // Hook install owns the prompt; a `run` typed alongside would have
         // its preexec/done eaten by echo_swallow and then be ^C'd.
