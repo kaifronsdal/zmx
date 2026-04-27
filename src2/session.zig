@@ -443,6 +443,12 @@ pub const Session = struct {
             return;
         }
         if (self.sentAt(depth)) |r| {
+            // A `done` arriving before our bytes have even reached the PTY
+            // is from something else (^C at the prompt, write-abort cleanup)
+            // — don't credit it. We can't gate on `accepted`: bash's DEBUG
+            // trap doesn't fire for subshells/group commands, so `(exit 42)`
+            // legitimately produces `done` without `preexec`.
+            if (r.flushed_ns == 0) return;
             const req = self.removeReq(r);
             try self.complete(req, .{ .exit_code = d.exit_code, .via = .osc_done, .dur_ms = d.dur_ms });
         }
@@ -925,6 +931,7 @@ test "queueRun while idle: type, preexec, done -> completion" {
     const want = "\x15\x1b[200~echo hi\x1b[201~\r";
     try testing.expect(std.mem.endsWith(u8, s.pendingPtyInput(), want));
     try testing.expect(s.run_queue.items[0].sent);
+    s.consumePtyInput(s.pendingPtyInput().len);
 
     var b: [128]u8 = undefined;
     try s.feedPtyOutput(preexecOsc(&b, TPID));
@@ -993,6 +1000,7 @@ test "prompt ignored when hooked" {
     try hookAndIdle(&s);
 
     try s.queueRun(1, "x", false);
+    s.consumePtyInput(s.pendingPtyInput().len);
     var b: [128]u8 = undefined;
     try s.feedPtyOutput(preexecOsc(&b, TPID));
     // Hooked: ?2004h is not authoritative, done is.
@@ -1199,6 +1207,34 @@ test "cancelClientRuns drops only unsent for that client" {
     try testing.expect(s.run_queue.items[0].sent);
     try testing.expectEqualStrings("b", s.run_queue.items[1].cmd);
     try testing.expectEqual(@as(u32, 2), s.run_queue.items[1].client_id);
+}
+
+test "done without preexec is not credited to a typed-but-unaccepted request" {
+    // ^C at the prompt, an empty line, or a write-abort cleanup all produce
+    // a `done` (precmd fires) with no matching preexec. If a run was queued
+    // into pty_input but its bytes haven't reached the shell yet, that done
+    // must not complete it.
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    // Stray ^C is queued first; the run is typed after it. Neither flushed.
+    try s.queueSend("\x03");
+    try s.queueRun(7, "echo hi", false);
+    try testing.expect(s.run_queue.items[0].sent);
+    try testing.expectEqual(@as(i128, 0), s.run_queue.items[0].flushed_ns);
+
+    // ^C → precmd → done;130. Our bytes not flushed ⇒ NOT our completion.
+    var b: [128]u8 = undefined;
+    try s.feedPtyOutput(doneOsc(&b, TPID, 130, "/", 0));
+    try testing.expectEqual(@as(usize, 0), s.completions().len);
+    try testing.expectEqual(@as(usize, 1), s.run_queue.items.len);
+
+    // The real bracket then arrives.
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 1));
+    try testing.expectEqual(@as(?i32, 0), s.completions()[0].result.exit_code);
 }
 
 test "?2004h-then-done split across reads: request typed in gap is upgraded" {

@@ -174,7 +174,7 @@ pub fn buildInstall(allocator: std.mem.Allocator, shell: Shell) ![]u8 {
 /// (incl. `\n` per line). Caller then streams exactly `n` bytes. Caller
 /// frees.
 pub fn writeOpener(allocator: Allocator, path: []const u8, n: u64, gzip: bool) ![]u8 {
-    const q = try posixQuote(allocator, path);
+    const q = try quoteRedirectTarget(allocator, path);
     defer allocator.free(q);
     return std.fmt.allocPrint(
         allocator,
@@ -183,6 +183,18 @@ pub fn writeOpener(allocator: Allocator, path: []const u8, n: u64, gzip: bool) !
             paste_close,
         .{ n, if (gzip) " | gunzip" else "", q },
     );
+}
+
+/// Quote `path` for use as a redirect target. `~/…` keeps the tilde
+/// unquoted so the shell expands it (tilde expansion happens before quote
+/// removal, so `~/'rest'` → `$HOME/rest`); everything else is posixQuote'd.
+fn quoteRedirectTarget(allocator: Allocator, path: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, path, "~/")) {
+        const q = try posixQuote(allocator, path[2..]);
+        defer allocator.free(q);
+        return std.fmt.allocPrint(allocator, "~/{s}", .{q});
+    }
+    return posixQuote(allocator, path);
 }
 
 /// Encoded body length for `raw_len` input bytes, given the client's

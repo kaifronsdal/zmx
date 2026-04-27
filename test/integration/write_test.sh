@@ -15,8 +15,9 @@ cleanup() { rm -f "$src" "$dst" "$dst.nogz"; rm -rf /tmp/zmyth-nogz-path; }
 trap cleanup EXIT
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Round-trip matrix. Relative dst path forces the PTY path (not local-FS),
-# so this exercises the encode/decode pipeline in every shell.
+# Round-trip matrix. ZMYTH_WRITE_FORCE_PTY=1 forces the PTY path even at
+# depth 0 so the encode/decode pipeline is exercised in every shell (without
+# it, depth-0 writes take local-FS regardless of path syntax).
 # ─────────────────────────────────────────────────────────────────────────────
 echo "── round-trip: 3 shells × 4 sizes × file/pipe (PTY path) ──"
 reldst="$(basename "$dst")"
@@ -26,7 +27,8 @@ for sh in bash zsh fish; do
     head -c "$sz" /dev/urandom > "$src"
     for mode in file pipe; do
       rm -f "$dst"
-      SHELL=$(command -v "$sh") "$ZMX" run "wt-$sh" -- "cd $(dirname "$dst")" >/dev/null 2>&1
+      SHELL=$(command -v "$sh") ZMYTH_WRITE_FORCE_PTY=1 \
+        "$ZMX" run "wt-$sh" -- "cd $(dirname "$dst")" >/dev/null 2>&1
       if [ "$mode" = file ]; then
         timeout 30 "$ZMX" write "wt-$sh" "$reldst" < "$src" 2>&1
       else
@@ -56,19 +58,38 @@ chk "local-FS: fast (<100ms, got $((t1-t0))ms)" "[ $((t1-t0)) -lt 100 ]"
 sb=$("$ZMX" read wt-local 2>/dev/null)
 echo "$sb" | grep -q 'head -c'
 chk "local-FS: no opener typed into shell" "[ $? -ne 0 ]"
+echo "$sb" | grep -q 'zmyth: wrote'
+chk "local-FS: trace marker in scrollback" "[ $? -eq 0 ]"
 nuke wt-local
 
-# Relative path → falls through to PTY path (opener IS typed).
-echo "── relative path → PTY path (no local-FS) ──"
+# Relative path at depth 0: daemon resolves against the shell's cwd (from
+# the last `done` OSC) and STILL takes local-FS.
+echo "── relative path (depth 0) → local-FS via lastCwd ──"
 rm -f "$dst"
 "$ZMX" run wt-rel -- "cd $(dirname "$dst")" >/dev/null 2>&1
 timeout 10 "$ZMX" write wt-rel "$reldst" < "$src"
 "$ZMX" run wt-rel -- true >/dev/null 2>&1
 cmp -s "$src" "$dst"
-chk "relative path: round-trip" "[ $? -eq 0 ]"
-"$ZMX" read wt-rel 2>/dev/null | grep -q 'head -c'
-chk "relative path: opener typed (PTY path used)" "[ $? -eq 0 ]"
+chk "relative→local-FS: round-trip" "[ $? -eq 0 ]"
+sb=$("$ZMX" read wt-rel 2>/dev/null)
+echo "$sb" | grep -q 'head -c'
+chk "relative→local-FS: no opener typed" "[ $? -ne 0 ]"
+echo "$sb" | grep -q 'zmyth: wrote'
+chk "relative→local-FS: trace marker in scrollback" "[ $? -eq 0 ]"
 nuke wt-rel
+
+# Paths needing shell expansion (~, $VAR) fall through to PTY so the SHELL
+# expands them — the daemon's $HOME may be stale.
+echo "── shell-expansion paths (~/, \$VAR) → PTY path ──"
+rm -f "$HOME/.zmyth-wt-tilde"
+"$ZMX" run wt-exp -- true >/dev/null 2>&1
+printf 'tilde test' | timeout 10 "$ZMX" write wt-exp '~/.zmyth-wt-tilde'
+"$ZMX" run wt-exp -- true >/dev/null 2>&1
+chk "~/ path: round-trip" "[ \"\$(cat \"$HOME/.zmyth-wt-tilde\" 2>/dev/null)\" = 'tilde test' ]"
+"$ZMX" read wt-exp 2>/dev/null | grep -q 'head -c'
+chk "~/ path: PTY path used (opener typed)" "[ $? -eq 0 ]"
+rm -f "$HOME/.zmyth-wt-tilde"
+nuke wt-exp
 
 # ─────────────────────────────────────────────────────────────────────────────
 # gzip: gunzip present (it is on this box) → opener includes `gunzip`.
@@ -76,7 +97,7 @@ nuke wt-rel
 # ─────────────────────────────────────────────────────────────────────────────
 echo "── gzip: opener includes gunzip when available ──"
 head -c 102400 /dev/zero > "$src"; rm -f "$dst"
-"$ZMX" run wt-gz -- "cd $(dirname "$dst")" >/dev/null 2>&1
+ZMYTH_WRITE_FORCE_PTY=1 "$ZMX" run wt-gz -- "cd $(dirname "$dst")" >/dev/null 2>&1
 timeout 10 "$ZMX" write wt-gz "$reldst" < "$src"
 "$ZMX" run wt-gz -- true >/dev/null 2>&1
 cmp -s "$src" "$dst"
@@ -87,7 +108,7 @@ nuke wt-gz
 
 # Compressible vs incompressible: 5MB zeros via gzip should beat 5MB random.
 echo "── gzip: compressible data is faster than incompressible ──"
-"$ZMX" run wt-gzp -- "cd $(dirname "$dst")" >/dev/null 2>&1
+ZMYTH_WRITE_FORCE_PTY=1 "$ZMX" run wt-gzp -- "cd $(dirname "$dst")" >/dev/null 2>&1
 head -c 5242880 /dev/zero > "$src"; rm -f "$dst"
 t0=$(now_ms); timeout 30 "$ZMX" write wt-gzp "$reldst" < "$src"; "$ZMX" run wt-gzp -- true >/dev/null; t1=$(now_ms)
 zeros_ms=$((t1-t0))
@@ -113,7 +134,8 @@ for b in bash head base64 stty cat sed; do
 done
 head -c 102400 /dev/zero > "$src"; rm -f "$dst.nogz"
 # HOME → empty dir so the user's ~/.bashrc (which expects a full PATH) is skipped.
-PATH="$nogz" SHELL="$nogz/bash" HOME="$nogz/home" "$ZMX" run wt-nogz -- "cd $(dirname "$dst")" >/dev/null 2>&1
+PATH="$nogz" SHELL="$nogz/bash" HOME="$nogz/home" ZMYTH_WRITE_FORCE_PTY=1 \
+  "$ZMX" run wt-nogz -- "cd $(dirname "$dst")" >/dev/null 2>&1
 gz=$(jget wt-nogz has_gunzip)
 chk "no-gunzip: hook reports has_gunzip=false (got '$gz')" "[ '$gz' = false ]"
 timeout 10 "$ZMX" write wt-nogz "$(basename "$dst.nogz")" < "$src"
@@ -129,7 +151,7 @@ nuke wt-nogz
 # ─────────────────────────────────────────────────────────────────────────────
 echo "── abort: client dies mid-write → session recovers ──"
 head -c 10485760 /dev/urandom > "$src"; rm -f "$dst"
-"$ZMX" run wt-abort -- "cd $(dirname "$dst")" >/dev/null 2>&1
+ZMYTH_WRITE_FORCE_PTY=1 "$ZMX" run wt-abort -- "cd $(dirname "$dst")" >/dev/null 2>&1
 # `timeout 0.2` SIGTERMs the write client itself (not a wrapper subshell).
 timeout 0.2 "$ZMX" write wt-abort "$reldst" < "$src" 2>/dev/null
 # Session should recover: a follow-up run completes.

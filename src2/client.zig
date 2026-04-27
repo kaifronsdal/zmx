@@ -829,35 +829,20 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
         }
     }
 
-    // Compress; report gz_enc_len=0 if it didn't shrink (incompressible) or
-    // gzip is unavailable, so the daemon picks plain even when the target
-    // has gunzip. Absolute paths at depth 0 take the local-FS shortcut and
-    // never use the gzip body, so skip the compress for those — at the cost
-    // of also skipping gzip for absolute paths into a *nested* layer (rare;
-    // falls back to plain, still correct).
-    const likely_local = path.len > 0 and (path[0] == '/' or std.mem.startsWith(u8, path, "~/"));
-    const gz_buf: []const u8 = if (likely_local)
-        ""
-    else
-        (try gzipCompress(allocator, raw.items)) orelse "";
-    defer allocator.free(gz_buf);
-    const plain_enc_len = sh.writeEncLen(raw.items.len);
-    const gz_enc_len: u64 = if (gz_buf.len > 0 and gz_buf.len < raw.items.len)
-        sh.writeEncLen(gz_buf.len)
-    else
-        0;
-
     const sock = connectOrFail(allocator, name, "write") orelse return 1;
     defer posix.close(sock);
 
     var hdr: std.ArrayList(u8) = .empty;
     defer hdr.deinit(allocator);
-    try hdr.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u64, plain_enc_len)));
-    try hdr.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u64, gz_enc_len)));
+    const raw_len: u64 = raw.items.len;
+    try hdr.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u64, raw_len)));
     try hdr.appendSlice(allocator, path);
     try ipc.sendBlocking(sock, .write_hdr, hdr.items);
 
-    const mode: u8 = blk: {
+    // Daemon replies with the mode it can support: 'L' (local-FS direct),
+    // 'z' (PTY, gunzip available), 'p' (PTY, plain only). Compression
+    // happens AFTER this so local-FS pays no gzip cost.
+    const offered: u8 = blk: {
         const reply = try ipc.recvBlocking(allocator, sock);
         defer allocator.free(reply.payload);
         if (reply.tag == .err) {
@@ -868,15 +853,33 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
         break :blk reply.payload[0];
     };
 
-    // 'L' = daemon writes file directly (raw chunks). 'z'/'p' = PTY path
-    // (base64-encode gz_buf or raw respectively). One ack per chunk is the
-    // backpressure signal.
-    const body: []const u8 = switch (mode) {
-        'L', 'p' => raw.items,
-        'z' => gz_buf,
+    var gz_buf: []const u8 = "";
+    defer allocator.free(gz_buf);
+    const body: []const u8, const b64: bool = switch (offered) {
+        'L' => .{ raw.items, false },
+        'z', 'p' => blk: {
+            // Try gzip when offered; downgrade to plain if it didn't shrink
+            // or gzip is missing client-side.
+            if (offered == 'z') if (try gzipCompress(allocator, raw.items)) |g| {
+                gz_buf = g;
+            };
+            const use_gz = gz_buf.len > 0 and gz_buf.len < raw.items.len;
+            const src = if (use_gz) gz_buf else raw.items;
+            var begin: [9]u8 = undefined;
+            begin[0] = if (use_gz) 'z' else 'p';
+            std.mem.writeInt(u64, begin[1..9], sh.writeEncLen(src.len), .little);
+            try ipc.sendBlocking(sock, .write_begin, &begin);
+            const ack = try ipc.recvBlocking(allocator, sock);
+            defer allocator.free(ack.payload);
+            if (ack.tag != .ack) {
+                if (ack.tag == .err) errf("zmyth: write: {s}\n", .{ack.payload});
+                return 1;
+            }
+            break :blk .{ src, true };
+        },
         else => return 1,
     };
-    try writeStream(allocator, sock, body, mode != 'L');
+    try writeStream(allocator, sock, body, b64);
 
     try ipc.sendBlocking(sock, .write_data, "");
     const reply = try ipc.recvBlocking(allocator, sock);

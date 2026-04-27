@@ -145,12 +145,9 @@ const Client = struct {
     wants_output: bool = false,
     /// Blocked in `.wait`; receives `.run_done` once the session is idle.
     waiting: bool = false,
-    /// `.write_data` chunk received while pty_input was over the backpressure
-    /// threshold; `.ack` is deferred until servicePty drains it.
+    /// `.write_begin`/`.write_data` received while pty_input was over the
+    /// backpressure threshold; `.ack` is deferred until servicePty drains it.
     write_ack_pending: bool = false,
-    /// Mode byte sent in the deferred `.write_hdr` ack: 'z' (gzip) or 'p'.
-    /// The local-FS path acks immediately so doesn't use this.
-    write_mode: u8 = 'p',
     closed: bool = false,
     /// Last reported terminal size from this client (for leader promotion).
     rows: u16 = 24,
@@ -182,9 +179,12 @@ const Daemon = struct {
 
     /// Client id of the in-flight `write` (only one at a time).
     write_client: ?u32 = null,
-    /// Local-FS shortcut: depth-0 absolute-path writes go straight to this fd
-    /// instead of through the PTY. null when the PTY path is in use.
+    /// Local-FS shortcut: depth-0 writes go straight to this fd instead of
+    /// through the PTY. null when the PTY path is in use.
     write_local_fd: ?posix.fd_t = null,
+    /// Resolved absolute path for the in-flight write (owned). Used to
+    /// construct `.write_begin`'s opener (PTY) or the trace marker (local).
+    write_path: []u8 = &.{},
 
     created_ts: i64,
     pollfds: std.ArrayList(posix.pollfd) = .empty,
@@ -682,15 +682,15 @@ fn reapClosedClients(d: *Daemon) void {
         // If this client owned an in-flight write, ^C so the shell returns
         // to the prompt (head -c N would otherwise wait for the missing
         // bytes; base64 -d will leave a partial file but the session isn't
-        // wedged). For the local-FS path, just close the fd.
+        // wedged). For the local-FS path, endWrite closes the fd. Skip ^C
+        // if nothing is queued or running (client died before .write_begin).
         if (d.write_client == c.id) {
-            if (d.write_local_fd) |fd| {
-                posix.close(fd);
-                d.write_local_fd = null;
-            } else {
+            if (d.write_local_fd == null and
+                (d.session.topCmdRunning() or d.session.pendingPtyInput().len > 0))
+            {
                 d.session.queueSend("\x03") catch {};
             }
-            d.write_client = null;
+            endWrite(d, null);
         }
         c.framer.deinit();
         posix.close(c.fd);
@@ -798,6 +798,7 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             }
         },
         .write_hdr => try handleWriteHdr(d, c, msg.payload),
+        .write_begin => try handleWriteBegin(d, c, msg.payload),
         .write_data => try handleWriteData(d, c, msg.payload),
         .kill => {
             const sig: u8 = if (msg.payload.len >= 1) msg.payload[0] else @intCast(posix.SIG.TERM);
@@ -922,10 +923,10 @@ fn handleInfo(d: *Daemon, c: *Client) !void {
 }
 
 fn handleWriteHdr(d: *Daemon, c: *Client, payload: []const u8) !void {
-    if (payload.len < 16) return queueErr(c, "write: short header", .{});
-    const plain_len = std.mem.readInt(u64, payload[0..8], .little);
-    const gz_len = std.mem.readInt(u64, payload[8..16], .little);
-    const path = payload[16..];
+    if (payload.len < 8) return queueErr(c, "write: short header", .{});
+    const raw_len = std.mem.readInt(u64, payload[0..8], .little);
+    _ = raw_len;
+    const path = payload[8..];
     if (path.len == 0 or path.len >= 4096)
         return queueErr(c, "write: invalid path length", .{});
     // ESC would let the path terminate the bracketed-paste wrapper early.
@@ -935,23 +936,26 @@ fn handleWriteHdr(d: *Daemon, c: *Client, payload: []const u8) !void {
         return queueErr(c, "write: another write in progress", .{});
 
     // Local-FS shortcut: at depth 0 the daemon and shell share a filesystem
-    // namespace, so an absolute path (or `~/…`) means the same thing to both
-    // — open and write it directly, no PTY round-trip. Relative paths fall
-    // through (only the shell knows its cwd reliably).
-    if (d.session.layers.len == 1) if (writeLocalPath(d.gpa, path)) |abs| {
-        defer d.gpa.free(abs);
-        const fd = posix.open(abs, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .TRUNC = true,
-        }, 0o644) catch |e| {
-            return queueErr(c, "write: open {s}: {s}", .{ abs, @errorName(e) });
-        };
-        d.write_client = c.id;
-        d.write_local_fd = fd;
-        try c.framer.queue(.ack, "L");
-        return;
-    };
+    // namespace. Absolute paths resolve identically; relative paths resolve
+    // against the shell's cwd which the last `done` reported. Only paths
+    // that need *shell expansion* (`~`, `$VAR`) fall through to the PTY.
+    if (d.session.layers.len == 1 and posix.getenv("ZMYTH_WRITE_FORCE_PTY") == null) {
+        if (writeLocalPath(d.gpa, path, d.session.lastCwd())) |abs| {
+            const fd = posix.open(abs, .{
+                .ACCMODE = .WRONLY,
+                .CREAT = true,
+                .TRUNC = true,
+            }, 0o644) catch |e| {
+                d.gpa.free(abs);
+                return queueErr(c, "write: open {s}: {s}", .{ path, @errorName(e) });
+            };
+            d.write_client = c.id;
+            d.write_local_fd = fd;
+            d.write_path = abs;
+            try c.framer.queue(.ack, "L");
+            return;
+        }
+    }
 
     if (d.session.run_queue.items.len > 0)
         return queueErr(c, "write: session busy", .{});
@@ -962,55 +966,81 @@ fn handleWriteHdr(d: *Daemon, c: *Client, payload: []const u8) !void {
     if (!d.session.topHooked())
         return queueErr(c, "write: requires shell integration", .{});
 
-    // gzip if the layer reports gunzip AND the client says it shrank
-    // (gz_len > 0 and < plain_len). Incompressible data sends plain.
-    const gzip = d.session.topHasGunzip() and gz_len > 0 and gz_len < plain_len;
-    const opener = try shell.writeOpener(d.gpa, path, if (gzip) gz_len else plain_len, gzip);
+    d.write_client = c.id;
+    d.write_path = try d.gpa.dupe(u8, path);
+    // Tell the client whether the layer can gunzip; client decides 'z'/'p'
+    // (it may pick 'p' even when offered 'z' if the data didn't compress)
+    // and reports back via `.write_begin` with the actual encoded length.
+    try c.framer.queue(.ack, if (d.session.topHasGunzip()) "z" else "p");
+}
+
+/// Resolve `path` to an absolute path the daemon can open directly, or null
+/// if it requires shell-side expansion. Caller frees.
+fn writeLocalPath(gpa: Allocator, path: []const u8, cwd: []const u8) ?[]u8 {
+    // `~`/`$` need shell expansion — daemon's $HOME may be stale, and we
+    // don't expand variables.
+    if (path[0] == '~' or std.mem.indexOfScalar(u8, path, '$') != null) return null;
+    if (path[0] == '/') return gpa.dupe(u8, path) catch null;
+    if (cwd.len == 0) return null;
+    return std.fs.path.join(gpa, &.{ cwd, path }) catch null;
+}
+
+fn handleWriteBegin(d: *Daemon, c: *Client, payload: []const u8) !void {
+    if (d.write_client != c.id or d.write_local_fd != null or payload.len < 9)
+        return queueErr(c, "write: unexpected begin", .{});
+    const gzip = payload[0] == 'z';
+    const enc_len = std.mem.readInt(u64, payload[1..9], .little);
+
+    const opener = try shell.writeOpener(d.gpa, d.write_path, enc_len, gzip);
     defer d.gpa.free(opener);
     try d.session.queueSend(opener);
 
-    d.write_client = c.id;
-    // Defer the hdr ack until `preexec` arrives. The line editor over-reads
+    // Defer the ack until `preexec` arrives. The line editor over-reads
     // whatever is in the kernel PTY buffer when it accepts the command, so
     // body bytes written before that are eaten or mistranslated. preexec is
     // the positive signal that the editor has handed the tty to head.
     c.write_ack_pending = true;
-    c.write_mode = if (gzip) 'z' else 'p';
 }
 
-/// Resolve `path` to an absolute path the daemon can open directly, or null
-/// if it's relative (only the shell can resolve those). Caller frees.
-fn writeLocalPath(gpa: Allocator, path: []const u8) ?[]u8 {
-    if (path.len == 0) return null;
-    if (path[0] == '/') return gpa.dupe(u8, path) catch null;
-    if (std.mem.startsWith(u8, path, "~/")) {
-        const home = posix.getenv("HOME") orelse return null;
-        return std.fmt.allocPrint(gpa, "{s}/{s}", .{ home, path[2..] }) catch null;
+fn endWrite(d: *Daemon, n_written: ?u64) void {
+    if (d.write_local_fd) |fd| {
+        posix.close(fd);
+        d.write_local_fd = null;
+        // Type a no-op so the scrollback shows what happened (the PTY path
+        // already leaves the opener visible). Skip if the prompt is busy —
+        // correctness doesn't depend on it.
+        if (n_written) |n| if (d.session.canType()) {
+            var buf: [4352]u8 = undefined;
+            if (std.fmt.bufPrint(
+                &buf,
+                "\x15\x1b[200~: 'zmyth: wrote {d} bytes -> {s}'\x1b[201~\r",
+                .{ n, d.write_path },
+            )) |trace| d.session.queueSend(trace) catch {} else |_| {}
+        };
     }
-    return null;
+    d.gpa.free(d.write_path);
+    d.write_path = &.{};
+    d.write_client = null;
 }
 
 fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
     if (d.write_client != c.id) return queueErr(c, "write: no write in progress", .{});
     if (d.write_local_fd) |fd| {
         if (payload.len == 0) {
-            posix.close(fd);
-            d.write_local_fd = null;
-            d.write_client = null;
+            const n = (posix.lseek_CUR_get(fd) catch 0);
+            endWrite(d, n);
             try c.framer.queue(.ack, "");
             return;
         }
         @import("io.zig").writeAllFd(fd, payload) catch |e| {
-            posix.close(fd);
-            d.write_local_fd = null;
-            d.write_client = null;
+            endWrite(d, null);
             return queueErr(c, "write: {s}", .{@errorName(e)});
         };
         try c.framer.queue(.ack, "");
         return;
     }
     if (payload.len == 0) {
-        d.write_client = null;
+        endWrite(d, null);
         try c.framer.queue(.ack, "");
         return;
     }
@@ -1034,9 +1064,7 @@ fn releaseWriteAck(d: *Daemon) void {
     if (d.session.pendingPtyInput().len >= write_backpressure) return;
     if (d.findClient(id)) |wc| if (wc.write_ack_pending) {
         wc.write_ack_pending = false;
-        // The hdr ack carries the mode; chunk acks reuse it (client ignores
-        // the payload after the first).
-        queueOrClose(wc, .ack, &.{wc.write_mode});
+        queueOrClose(wc, .ack, "");
     };
 }
 

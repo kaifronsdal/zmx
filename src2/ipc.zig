@@ -21,8 +21,9 @@ pub const Tag = enum(u8) {
     run, //        u8 interactive (0/1), then command string
     send, //       raw bytes for PTY
     read, //       u8 mode (0=scrollback,1=screen,2=follow), u32 tail_n
-    write_hdr, //  u64 plain-enc-len, u64 gz-enc-len (0=skip), then path
-    write_data, // chunk (raw for 'L', base64 for 'p'/'z'); empty = EOF
+    write_hdr, //   u64 raw-len, then path → ack 'L' | 'z' | 'p'
+    write_begin, // u8 mode ('z'|'p'), u64 enc-len  (skipped for 'L')
+    write_data, //  chunk (raw for 'L', base64 for 'p'/'z'); empty = EOF
     info, //       (empty)
     wait, //       (empty)
     kill, //       u8 signal (default SIGTERM)
