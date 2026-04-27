@@ -14,7 +14,6 @@ const ipc = @import("ipc.zig");
 const pty = @import("pty.zig");
 const compat = @import("compat.zig");
 const paths = @import("paths.zig");
-const spawn = @import("spawn.zig");
 const shell = @import("shell.zig");
 const protocol = @import("protocol.zig");
 const input = @import("input.zig");
@@ -176,7 +175,7 @@ const Daemon = struct {
     pty_fd: posix.fd_t,
     lock_fd: posix.fd_t,
     shell_pid: posix.pid_t,
-    /// What spawn.zig detected from `$SHELL`. `.unknown` means the shell will
+    /// What `spawnShell` detected from `$SHELL`. `.unknown` means the shell will
     /// never announce, so `.run` requests cannot work — refuse them up front.
     spawned_shell: protocol.Shell,
     /// Set by the SIGCHLD reaper if it wins the race against handlePtyEof.
@@ -285,7 +284,7 @@ fn daemonMain(name: []const u8, initial_cmd: ?[]const []const u8) !void {
     // Non-blocking master so the poll loop never wedges on read/write.
     try pty.setNonBlock(p.master, true);
 
-    const spawned = try spawn.spawnShell(gpa, &p, name, sp.rc_dir, sp.env_dir, initial_cmd);
+    const spawned = try shell.spawnShell(gpa, &p, name, sp.rc_dir, sp.env_dir, initial_cmd);
 
     // ── listen (lock held; safe to clear any stale socket file) ──────
     posix.unlink(sp.sock) catch {};
@@ -836,7 +835,7 @@ fn handleAttach(d: *Daemon, c: *Client, payload: []const u8) !void {
     d.promoteLeader(c);
 
     // Env refresh (#104): KEY=VAL\0KEY=VAL\0...
-    spawn.refreshEnvLinks(d.sp.env_dir, payload[4..]) catch |err| {
+    shell.refreshEnvLinks(d.sp.env_dir, payload[4..]) catch |err| {
         log.warn("env refresh: {s}", .{@errorName(err)});
     };
 

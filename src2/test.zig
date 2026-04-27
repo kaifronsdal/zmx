@@ -7,7 +7,6 @@ comptime {
     _ = @import("pty.zig");
     _ = @import("input.zig");
     _ = @import("term_state.zig");
-    _ = @import("spawn.zig");
     _ = @import("session.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");
