@@ -8,7 +8,7 @@ _zmyth_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local verbs="attach run send read ls wait kill mv detach version help completions"
+    local verbs="attach run send read ls wait kill hook detach version help completions"
 
     if [[ $COMP_CWORD -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$verbs" -- "$cur"))
@@ -40,7 +40,7 @@ _zmyth_completions() {
             ;;
         read)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "-f -s -n --vt --html" -- "$cur"))
+                COMPREPLY=($(compgen -W "-f -s -n" -- "$cur"))
             else
                 COMPREPLY=($(compgen -W "$(_zmyth_sessions)" -- "$cur"))
             fi
@@ -59,11 +59,6 @@ _zmyth_completions() {
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=($(compgen -W "-9" -- "$cur"))
             else
-                COMPREPLY=($(compgen -W "$(_zmyth_sessions)" -- "$cur"))
-            fi
-            ;;
-        mv)
-            if [[ $COMP_CWORD -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "$(_zmyth_sessions)" -- "$cur"))
             fi
             ;;

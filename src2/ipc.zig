@@ -20,13 +20,12 @@ pub const Tag = enum(u8) {
     resize, //     u16 cols, u16 rows
     run, //        u8 interactive (0/1), then command string
     send, //       raw bytes for PTY
-    read, //       u8 mode (0=scrollback,1=screen,2=follow), u8 fmt, u32 tail_n
+    read, //       u8 mode (0=scrollback,1=screen,2=follow), u32 tail_n
     write_hdr, //  target path string
     write_data, // chunk of base64; empty = EOF
     info, //       (empty)
     wait, //       (empty)
     kill, //       u8 signal (default SIGTERM)
-    rename, //     new name string
     detach, //     (empty)
     hook, //       (empty)
     // ── daemon → client ──────────────────────────────────────────────────

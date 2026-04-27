@@ -30,7 +30,6 @@ _zmyth() {
                 'ls:List sessions'
                 'wait:Wait for command(s) to finish'
                 'kill:Kill session(s)'
-                'mv:Rename a session'
                 'detach:Detach client(s) from a session'
                 'version:Show version'
                 'help:Show help'
@@ -58,8 +57,6 @@ _zmyth() {
                         '-f[follow]' \
                         '-s[screen snapshot]' \
                         '-n[tail N lines]:lines:' \
-                        '--vt[VT-formatted output]' \
-                        '--html[HTML-formatted output]' \
                         '1: :_zmyth_sessions'
                     ;;
                 ls)
@@ -76,9 +73,6 @@ _zmyth() {
                     _arguments \
                         '-9[SIGKILL]' \
                         '*: :_zmyth_sessions'
-                    ;;
-                mv)
-                    _arguments '1: :_zmyth_sessions' '2:new name:'
                     ;;
                 detach)
                     _arguments '1: :_zmyth_sessions'

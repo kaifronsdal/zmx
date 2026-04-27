@@ -142,20 +142,6 @@ chk "10  read -s contains SCREEN-MARKER" "[ $? -eq 0 ]"
 nuke t10
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11. mv (#46): rename socket; renamed session still usable.
-# ─────────────────────────────────────────────────────────────────────────────
-"$ZMX" run t11 -- 'true' >/dev/null
-"$ZMX" mv t11 renamed11; ec=$?
-chk "11a mv ec=0" "[ $ec -eq 0 ]"
-"$ZMX" ls -q | grep -qx renamed11
-chk "11b ls shows new name" "[ $? -eq 0 ]"
-"$ZMX" ls -q | grep -qx t11
-chk "11c ls no longer shows old name" "[ $? -ne 0 ]"
-"$ZMX" run renamed11 -- 'true' >/dev/null
-chk "11d run on renamed session works" "[ $? -eq 0 ]"
-nuke renamed11
-
-# ─────────────────────────────────────────────────────────────────────────────
 # 12. glob kill
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run g-a -- true >/dev/null
@@ -321,20 +307,6 @@ kill "$fpid" 2>/dev/null; wait "$fpid" 2>/dev/null
 grep -q FOLLOW-MARK "$ZMYTH_DIR/follow.out"
 chk "24  read -f streams new output" "[ $? -eq 0 ]"
 nuke t24
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 25. mv onto existing name must refuse (no clobber).
-# BUG: handleRename calls posix.rename without checking for an existing target
-#      socket, so the live m-b daemon is silently orphaned. Daemon should
-#      stat/connect the target first and queueErr if it exists.
-# ─────────────────────────────────────────────────────────────────────────────
-"$ZMX" run m-a -- true >/dev/null
-"$ZMX" run m-b -- true >/dev/null
-"$ZMX" mv m-a m-b >/dev/null 2>&1; ec=$?
-chk "25a mv onto existing name -> ec!=0" "[ $ec -ne 0 ]"
-"$ZMX" ls -q | grep -qx m-a
-chk "25b source session still present" "[ $? -eq 0 ]"
-nuke m-a m-b
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 26. run -j output ordering: command stdout precedes the trailing JSON line.

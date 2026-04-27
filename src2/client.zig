@@ -557,7 +557,6 @@ pub fn send(allocator: Allocator, args: []const [:0]const u8) !u8 {
 pub fn read(allocator: Allocator, args: []const [:0]const u8) !u8 {
     var follow = false;
     var screen = false;
-    var fmt: u8 = 0;
     var tail_n: u32 = 0;
     var name: ?[]const u8 = null;
     var i: usize = 0;
@@ -565,8 +564,6 @@ pub fn read(allocator: Allocator, args: []const [:0]const u8) !u8 {
         const a = args[i];
         if (eq(u8, a, "-f")) follow = true //
         else if (eq(u8, a, "-s")) screen = true //
-        else if (eq(u8, a, "--vt")) fmt = 1 //
-        else if (eq(u8, a, "--html")) fmt = 2 //
         else if (eq(u8, a, "-n")) {
             i += 1;
             if (i >= args.len) {
@@ -591,10 +588,9 @@ pub fn read(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const sock = connectOrFail(allocator, nm, "read") orelse return 1;
     defer posix.close(sock);
 
-    var payload: [6]u8 = undefined;
+    var payload: [5]u8 = undefined;
     payload[0] = if (follow) 2 else if (screen) 1 else 0;
-    payload[1] = fmt;
-    std.mem.writeInt(u32, payload[2..6], tail_n, .little);
+    std.mem.writeInt(u32, payload[1..5], tail_n, .little);
     try ipc.sendBlocking(sock, .read, &payload);
 
     while (true) {
@@ -881,25 +877,6 @@ pub fn kill(allocator: Allocator, args: []const [:0]const u8) !u8 {
         allocator.free(ack.payload);
     }
     return rc;
-}
-
-pub fn mv(allocator: Allocator, args: []const [:0]const u8) !u8 {
-    if (args.len != 2) {
-        errf("zmyth: mv: expected <old> <new>\n", .{});
-        return 2;
-    }
-    if (validateNameOrFail(args[0], "mv")) |rc| return rc;
-    if (validateNameOrFail(args[1], "mv")) |rc| return rc;
-    const sock = connectOrFail(allocator, args[0], "mv") orelse return 1;
-    defer posix.close(sock);
-    try ipc.sendBlocking(sock, .rename, args[1]);
-    const reply = try ipc.recvBlocking(allocator, sock);
-    defer allocator.free(reply.payload);
-    if (reply.tag == .err) {
-        errf("zmyth: mv: {s}\n", .{reply.payload});
-        return 1;
-    }
-    return 0;
 }
 
 pub fn detach(allocator: Allocator, args: []const [:0]const u8) !u8 {

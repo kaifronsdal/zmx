@@ -156,6 +156,8 @@ const Client = struct {
     attached: bool = false,
     /// Wants live `.output` frames (set on `.attach` and `.run`).
     wants_output: bool = false,
+    /// Blocked in `.wait`; receives `.run_done` once the session is idle.
+    waiting: bool = false,
     closed: bool = false,
     /// Last reported terminal size from this client (for leader promotion).
     rows: u16 = 24,
@@ -185,9 +187,6 @@ const Daemon = struct {
     next_client_id: u32 = 1,
     leader_id: ?u32 = null,
 
-    /// Client ids blocked in `.wait`; each gets a `.run_done` once the
-    /// session is idle (no run in flight, queue empty).
-    waiters: std.ArrayList(u32) = .empty,
     /// In-flight `write` heredoc; only one at a time.
     write_state: ?WriteState = null,
 
@@ -200,7 +199,6 @@ const Daemon = struct {
             posix.close(c.fd);
         }
         self.clients.deinit(self.gpa);
-        self.waiters.deinit(self.gpa);
         self.pollfds.deinit(self.gpa);
         self.session.deinit();
         self.gpa.free(self.name);
@@ -219,14 +217,6 @@ const Daemon = struct {
         // fails — neither should cost the client its leader status.
         self.session.resize(c.rows, c.cols) catch {};
         pty.setWinsize(self.pty_fd, .{ .rows = c.rows, .cols = c.cols }) catch {};
-    }
-
-    fn removeWaiter(self: *Daemon, id: u32) void {
-        var i: usize = 0;
-        while (i < self.waiters.items.len) {
-            if (self.waiters.items[i] == id) _ = self.waiters.swapRemove(i) //
-            else i += 1;
-        }
     }
 };
 
@@ -630,10 +620,7 @@ fn routeCompletions(d: *Daemon) void {
         };
         queueOrClose(c, .run_done, std.mem.asBytes(&wire));
         c.wants_output = false;
-        // This client just got its answer; if it had also issued `.wait` on
-        // the same connection, drop it from waiters so drainWaiters below
-        // doesn't send a second `.run_done`.
-        d.removeWaiter(c.id);
+        c.waiting = false;
     }
     if (comps.len > 0) d.session.clearCompletions();
     // Any transition to idle (run completion, or interactive command's `done`)
@@ -670,14 +657,11 @@ fn waitReplyWire(d: *Daemon) ipc.RunDoneWire {
 }
 
 fn drainWaiters(d: *Daemon) void {
-    if (d.waiters.items.len == 0) return;
     const wire = waitReplyWire(d);
-    for (d.waiters.items) |id| {
-        const c = d.findClient(id) orelse continue;
-        if (c.closed) continue;
+    for (d.clients.items) |*c| if (c.waiting and !c.closed) {
         queueOrClose(c, .run_done, std.mem.asBytes(&wire));
-    }
-    d.waiters.clearRetainingCapacity();
+        c.waiting = false;
+    };
 }
 
 fn reapClosedClients(d: *Daemon) void {
@@ -695,7 +679,6 @@ fn reapClosedClients(d: *Daemon) void {
         // Don't execute commands queued by a now-dead client.
         d.session.cancelClientRuns(c.id);
         d.session.cancelClientHook(c.id);
-        d.removeWaiter(c.id);
         // If this client owned an in-flight write, close the heredoc so the
         // shell returns to the prompt (body may be incomplete; base64 -d will
         // fail, but the session isn't wedged).
@@ -807,7 +790,7 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
                 const wire = waitReplyWire(d);
                 try c.framer.queue(.run_done, std.mem.asBytes(&wire));
             } else {
-                try d.waiters.append(d.gpa, c.id);
+                c.waiting = true;
             }
         },
         .write_hdr => try handleWriteHdr(d, c, msg.payload),
@@ -822,7 +805,6 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             // SIGTERM→SIGKILL on the shell.
             should_exit.store(true, .release);
         },
-        .rename => try handleRename(d, c, msg.payload),
         .hook => {
             if (try d.session.startHook(c.id, std.time.nanoTimestamp())) |refusal| {
                 try c.framer.queue(.err, refusal);
@@ -888,15 +870,9 @@ fn handleResize(d: *Daemon, c: *Client, payload: []const u8) !void {
 }
 
 fn handleRead(d: *Daemon, c: *Client, payload: []const u8) !void {
-    if (payload.len < 6) return queueErr(c, "read: short payload", .{});
+    if (payload.len < 5) return queueErr(c, "read: short payload", .{});
     const mode = payload[0];
-    const fmt: term_state.DumpFormat = switch (payload[1]) {
-        0 => .plain,
-        1 => .vt,
-        2 => .html,
-        else => .plain,
-    };
-    const tail_n = std.mem.readInt(u32, payload[2..6], .little);
+    const tail_n = std.mem.readInt(u32, payload[1..5], .little);
     const tail: ?usize = if (tail_n == 0) null else tail_n;
 
     var buf: std.Io.Writer.Allocating = .init(d.gpa);
@@ -909,12 +885,12 @@ fn handleRead(d: *Daemon, c: *Client, payload: []const u8) !void {
             try c.framer.queue(.eof, "");
         },
         2 => { // follow: scrollback then live .output
-            try term_state.dumpScrollback(d.gpa, &d.session.term, fmt, tail, &buf.writer);
+            try term_state.dumpScrollback(d.gpa, &d.session.term, tail, &buf.writer);
             try queueChunked(c, .data, buf.writer.buffered(), data_chunk);
             c.wants_output = true; // receive .output going forward; no .eof
         },
         else => { // 0: scrollback
-            try term_state.dumpScrollback(d.gpa, &d.session.term, fmt, tail, &buf.writer);
+            try term_state.dumpScrollback(d.gpa, &d.session.term, tail, &buf.writer);
             try queueChunked(c, .data, buf.writer.buffered(), data_chunk);
             try c.framer.queue(.eof, "");
         },
@@ -1008,56 +984,6 @@ fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
     const closer = std.fmt.bufPrint(&buf, "\n{s}\x1b[201~\r", .{&ws.delim}) catch unreachable;
     try d.session.queueSend(closer);
     d.write_state = null;
-    try c.framer.queue(.ack, "");
-}
-
-fn handleRename(d: *Daemon, c: *Client, new_name: []const u8) !void {
-    paths.validateName(new_name) catch {
-        return queueErr(c, "rename: invalid name", .{});
-    };
-    // Allocate everything up front; `committed` flips once the on-disk socket
-    // rename succeeds. Covers both error returns and the queueErr path without
-    // double-free or leaving Daemon pointers stale.
-    var committed = false;
-    const nn = try d.gpa.dupe(u8, new_name);
-    defer if (!committed) d.gpa.free(nn);
-    const new_sp = try paths.SessionPaths.init(d.gpa, new_name);
-    defer if (!committed) new_sp.deinit(d.gpa);
-
-    // Refuse to clobber another session: posix.rename() silently overwrites,
-    // which would orphan the other daemon (still running, socket gone). The
-    // access() probe alone is racy — between it and rename() another daemon
-    // could bind — so also take the new name's lock (same nonblocking flock
-    // ensure() uses) and hold it across the rename.
-    if (posix.access(new_sp.sock, posix.F_OK)) |_| {
-        return queueErr(c, "rename: '{s}' already exists", .{new_name});
-    } else |_| {}
-    const new_lock_fd = acquireLock(new_sp.lock) catch |err| switch (err) {
-        error.WouldBlock => return queueErr(c, "rename: '{s}' already exists", .{new_name}),
-        else => return queueErr(c, "rename: lock '{s}': {s}", .{ new_name, @errorName(err) }),
-    };
-
-    // Socket is the only rename whose failure aborts the operation: it is what
-    // clients discover the session by.
-    posix.rename(d.sp.sock, new_sp.sock) catch |err| {
-        posix.close(new_lock_fd);
-        posix.unlink(new_sp.lock) catch {};
-        return queueErr(c, "rename: {s}", .{@errorName(err)});
-    };
-    committed = true;
-    // New lock file is already in place and held; drop the old one.
-    posix.unlink(d.sp.lock) catch {};
-    posix.close(d.lock_fd);
-    d.lock_fd = new_lock_fd;
-    posix.rename(d.sp.rc_dir, new_sp.rc_dir) catch {};
-    posix.rename(d.sp.env_dir, new_sp.env_dir) catch {};
-    posix.rename(d.sp.log, new_sp.log) catch {};
-
-    d.gpa.free(d.name);
-    d.sp.deinit(d.gpa);
-    d.name = nn;
-    d.sp = new_sp;
-
     try c.framer.queue(.ack, "");
 }
 

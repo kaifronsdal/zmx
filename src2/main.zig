@@ -12,12 +12,11 @@ const usage =
     \\  run    [-d] [-j] [-i] <name> -- <cmd...>   run cmd, propagate exit code
     \\         -i: return when a nested prompt appears (e.g. ssh, docker exec)
     \\  send   <name> [- | <text>]            raw PTY input, no waiting
-    \\  read   <name> [-f] [-s] [-n N] [--vt|--html]
+    \\  read   <name> [-f] [-s] [-n N]
     \\  write  <name> <path>                  stdin -> file inside session
     \\  ls     [glob] [-j|-q]
     \\  wait   <name|glob>... [-j]
     \\  kill   <name|glob>... [-9]
-    \\  mv     <old> <new>
     \\  hook   [<name>]                       install shell hook into nested shell
     \\  detach [<name>]
     \\  version | help | completions <shell>
@@ -45,7 +44,6 @@ pub fn main() !u8 {
     if (eq(verb, "ls") or eq(verb, "list")) return client.ls(allocator, rest);
     if (eq(verb, "wait")) return client.wait(allocator, rest);
     if (eq(verb, "kill")) return client.kill(allocator, rest);
-    if (eq(verb, "mv") or eq(verb, "rename")) return client.mv(allocator, rest);
     if (eq(verb, "hook")) return client.hook(allocator, rest);
     if (eq(verb, "detach")) return client.detach(allocator, rest);
 

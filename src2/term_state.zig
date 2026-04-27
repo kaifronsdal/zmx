@@ -11,8 +11,6 @@
 const std = @import("std");
 const vt = @import("ghostty-vt");
 
-pub const DumpFormat = enum { plain, vt, html };
-
 /// Serialize full terminal state (scrollback + visible screen + modes/cursor)
 /// as VT bytes that, when written to a fresh terminal of the same size,
 /// reproduce the state. Used when a client attaches.
@@ -103,20 +101,13 @@ pub fn serializeForAttach(term: *vt.Terminal, writer: *std.Io.Writer) !void {
 pub fn dumpScrollback(
     allocator: std.mem.Allocator,
     term: *vt.Terminal,
-    fmt: DumpFormat,
     tail_n: ?usize,
     writer: *std.Io.Writer,
 ) !void {
-    const opts: vt.formatter.Options = switch (fmt) {
-        .plain => .plain,
-        .vt => .vt,
-        .html => .html,
-    };
-
     // Use ScreenFormatter on the primary screen directly so this works even
     // when the alt-screen is active (TerminalFormatter only sees active).
     const primary = term.screens.get(.primary).?;
-    var sf = vt.formatter.ScreenFormatter.init(primary, opts);
+    var sf = vt.formatter.ScreenFormatter.init(primary, .plain);
     sf.content = .{ .selection = null };
     sf.extra = .none;
 
@@ -529,7 +520,7 @@ test "dumpScrollback tail_n=2 returns last 2 lines" {
 
     var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
-    try dumpScrollback(alloc, &term, .plain, 2, &buf.writer);
+    try dumpScrollback(alloc, &term,2, &buf.writer);
     const out = buf.writer.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "line4") != null);
@@ -546,7 +537,7 @@ test "dumpScrollback tail_n larger than content returns all" {
 
     var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
-    try dumpScrollback(alloc, &term, .plain, 100, &buf.writer);
+    try dumpScrollback(alloc, &term,100, &buf.writer);
     const out = buf.writer.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "a") != null);
@@ -572,7 +563,7 @@ test "dumpScrollback null tail dumps everything" {
 
     var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
-    try dumpScrollback(alloc, &term, .plain, null, &buf.writer);
+    try dumpScrollback(alloc, &term,null, &buf.writer);
     const out = buf.writer.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "L0") != null);
@@ -591,7 +582,7 @@ test "dumpScrollback reads primary while on alt-screen" {
 
     var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
-    try dumpScrollback(alloc, &term, .plain, null, &buf.writer);
+    try dumpScrollback(alloc, &term,null, &buf.writer);
     const out = buf.writer.buffered();
 
     // Scrollback lives on the primary screen; alt-screen content must not leak.
