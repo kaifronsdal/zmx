@@ -96,17 +96,28 @@ pub const Scanner = struct {
         while (true) {
             const b = self.buf.items;
 
-            // Find the earliest marker.
-            var best: usize = std.math.maxInt(usize);
+            // Find the earliest marker. Both start with ESC, so one
+            // indexOfScalar pass classifies each ESC by its next byte and
+            // skips uninteresting ones (CSI colours etc.) without re-scanning.
+            var best: usize = b.len;
             var which: enum { none, osc, prompt } = .none;
-            if (std.mem.indexOf(u8, b, OSC_START)) |i| if (i < best) {
-                best = i;
-                which = .osc;
-            };
-            if (std.mem.indexOf(u8, b, BP_ON)) |i| if (i < best) {
-                best = i;
-                which = .prompt;
-            };
+            var scan: usize = 0;
+            while (std.mem.indexOfScalarPos(u8, b, scan, 0x1b)) |i| {
+                const rest = b[i..];
+                // Lone trailing ESC: undecidable; tail-trim below preserves it.
+                if (rest.len < 2) break;
+                if (rest[1] == ']') {
+                    best = i;
+                    which = .osc;
+                    break;
+                }
+                if (std.mem.startsWith(u8, rest, BP_ON)) {
+                    best = i;
+                    which = .prompt;
+                    break;
+                }
+                scan = i + 1;
+            }
 
             switch (which) {
                 .none => {

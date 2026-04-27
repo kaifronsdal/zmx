@@ -209,6 +209,10 @@ pub const Session = struct {
     // I/O queues — daemon drains/fills these.
     /// Bytes to write to PTY master.
     pty_input: std.ArrayList(u8),
+    /// Read cursor into pty_input. consumePtyInput() advances this instead of
+    /// memmove-shifting on every partial PTY write; the buffer is compacted
+    /// only on full drain or when the dead prefix grows large.
+    pty_input_pos: usize = 0,
     run_queue: std.ArrayList(RunRequest),
     completed: std.ArrayList(Completion),
     /// Scratch reused across feedPtyOutput calls.
@@ -551,24 +555,29 @@ pub const Session = struct {
 
     /// Bytes the daemon should write to the PTY master.
     pub fn pendingPtyInput(self: *Session) []const u8 {
-        return self.pty_input.items;
+        return self.pty_input.items[self.pty_input_pos..];
     }
 
     /// Discard the first `n` bytes of pending PTY input (after a successful
     /// write to the master).
     pub fn consumePtyInput(self: *Session, n: usize) void {
-        assert(n <= self.pty_input.items.len);
-        const rem = self.pty_input.items.len - n;
-        std.mem.copyForwards(u8, self.pty_input.items[0..rem], self.pty_input.items[n..]);
-        self.pty_input.shrinkRetainingCapacity(rem);
-        // The acceptance-timeout window opens once the typed bytes have
-        // actually reached the PTY. Any sent-but-unflushed request qualifies
-        // (with layers there can be at most one — only top accepts typing).
+        self.pty_input_pos += n;
+        assert(self.pty_input_pos <= self.pty_input.items.len);
+        const rem = self.pty_input.items.len - self.pty_input_pos;
         if (rem == 0) {
+            self.pty_input.clearRetainingCapacity();
+            self.pty_input_pos = 0;
+            // The acceptance-timeout window opens once the typed bytes have
+            // actually reached the PTY. Any sent-but-unflushed request
+            // qualifies (with layers there can be at most one).
             const now = std.time.nanoTimestamp();
             for (self.run_queue.items) |*r| if (r.sent and r.flushed_ns == 0) {
                 r.flushed_ns = now;
             };
+        } else if (self.pty_input_pos > 64 * 1024) {
+            std.mem.copyForwards(u8, self.pty_input.items[0..rem], self.pty_input.items[self.pty_input_pos..]);
+            self.pty_input.shrinkRetainingCapacity(rem);
+            self.pty_input_pos = 0;
         }
     }
 

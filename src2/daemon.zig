@@ -324,7 +324,9 @@ fn runLoop(d: *Daemon) !void {
     const idx_pty = 1;
     const fixed_fds = 2;
 
-    var read_buf: [4096]u8 = undefined;
+    // 64KB matches the Linux PTY kernel buffer, so one read drains it instead
+    // of looping 16× through poll/broadcast/timeout-check for the same burst.
+    var read_buf: [64 * 1024]u8 = undefined;
 
     while (true) {
         if (should_exit.load(.acquire)) break;

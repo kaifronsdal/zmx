@@ -19,8 +19,10 @@ const outf = io.outf;
 const errf = io.errf;
 const eq = std.mem.eql;
 
-const probe_connect_ms = 200;
-const probe_recv_timeout_us = 500_000;
+// Loopback RTT is <1ms; a healthy daemon answers `.info` instantly. These
+// bound how long `ls` stalls on a hung/unresponsive daemon, so keep them tight.
+const probe_connect_ms = 100;
+const probe_recv_timeout_us = 100_000;
 
 const env_forward = @import("shell.zig").env_forward;
 
