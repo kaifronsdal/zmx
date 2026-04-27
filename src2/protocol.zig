@@ -2,7 +2,8 @@
 //!
 //! Wire format (terminator is BEL `\x07` or ST `\x1b\\`):
 //!   ESC ] 2718;preexec;<pid> BEL
-//!   ESC ] 2718;done;<pid>;<ec>;<dur_ms>;<sh>;<cwd> BEL   (sh = b|z|f; cwd last)
+//!   ESC ] 2718;done;<pid>;<ec>;<dur_ms>;<cap>;<cwd> BEL
+//!     cap = <sh><flags>: sh ∈ b|z|f, flags ∋ 'g' (gunzip available); cwd last
 //!   ESC ] 2718;probe;b=<bash_v>,z=<zsh_v>,f=<fish_v>,h=<hook_v> BEL
 //!
 //! Also detects:
@@ -43,7 +44,14 @@ pub const Shell = enum {
     }
 };
 
-pub const Done = struct { pid: i32, exit_code: i32, cwd: []const u8, dur_ms: u64, shell: Shell };
+pub const Done = struct {
+    pid: i32,
+    exit_code: i32,
+    cwd: []const u8,
+    dur_ms: u64,
+    shell: Shell,
+    has_gunzip: bool,
+};
 /// Response to `probe_line`. `shell` is whichever of b=/z=/f= was non-empty
 /// (`.unknown` if none — sh/dash/ksh ran the printf with all vars empty).
 /// `shell_major` is the leading integer of that shell's `*_VERSION`.
@@ -222,12 +230,13 @@ pub const Scanner = struct {
                 .exit_code = ec,
                 .cwd = self.cwd_storage.items[off..],
                 .dur_ms = @intCast(@max(0, dur_i)),
-                .shell = if (sh_s.len == 1) switch (sh_s[0]) {
+                .shell = if (sh_s.len > 0) switch (sh_s[0]) {
                     'b' => .bash,
                     'z' => .zsh,
                     'f' => .fish,
                     else => .unknown,
                 } else .unknown,
+                .has_gunzip = std.mem.indexOfScalar(u8, sh_s[@min(1, sh_s.len)..], 'g') != null,
             } });
         } else if (std.mem.eql(u8, kind, "probe")) {
             try out.append(self.gpa, .{ .probe = parseProbe(it.rest()) });
@@ -311,12 +320,17 @@ test "Shell.parse" {
 test "done ST-terminated" {
     var s = Scanner.init(testing.allocator);
     defer s.deinit();
-    const ev = (try collectOne(&s, "\x1b]2718;done;1234;7;123;z;/tmp\x1b\\")).?;
+    const ev = (try collectOne(&s, "\x1b]2718;done;1234;7;123;zg;/tmp\x1b\\")).?;
     try testing.expectEqual(@as(i32, 1234), ev.done.pid);
     try testing.expectEqual(@as(i32, 7), ev.done.exit_code);
     try testing.expectEqualStrings("/tmp", ev.done.cwd);
     try testing.expectEqual(@as(u64, 123), ev.done.dur_ms);
     try testing.expectEqual(Shell.zsh, ev.done.shell);
+    try testing.expect(ev.done.has_gunzip);
+
+    const ev2 = (try collectOne(&s, "\x1b]2718;done;1;0;0;f;/\x07")).?;
+    try testing.expectEqual(Shell.fish, ev2.done.shell);
+    try testing.expect(!ev2.done.has_gunzip);
 }
 
 test "preexec" {

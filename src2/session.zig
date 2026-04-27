@@ -114,6 +114,8 @@ const Layer = struct {
     hooked: bool = false,
     /// preexec seen, done not yet. Meaningful only for the top layer.
     cmd_running: bool = false,
+    /// Hook's load-time `command -v gunzip` probe; `write` uses gzip when set.
+    has_gunzip: bool = false,
 };
 
 /// Nesting deeper than this is treated as a single layer (top is replaced
@@ -403,6 +405,7 @@ pub const Session = struct {
         layer.hooked = true;
         layer.cmd_running = false;
         layer.shell = d.shell;
+        layer.has_gunzip = d.has_gunzip;
 
         if (self.hook_pending) |*hp| {
             if (hp.echo_swallow > 0) {
@@ -509,6 +512,9 @@ pub const Session = struct {
     }
     pub fn topHooked(self: *Session) bool {
         return if (self.top()) |t| t.hooked else false;
+    }
+    pub fn topHasGunzip(self: *Session) bool {
+        return if (self.top()) |t| t.has_gunzip else false;
     }
     pub fn topCmdRunning(self: *Session) bool {
         return if (self.top()) |t| t.cmd_running else false;

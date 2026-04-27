@@ -169,19 +169,19 @@ pub fn buildInstall(allocator: std.mem.Allocator, shell: Shell) ![]u8 {
 // same kernel-buffer-full as the command itself (line editors over-read
 // whatever is available).
 
-/// `^U ⟨paste⟩stty -icanon -echo; head -c N | base64 -d > 'path'; stty
-/// icanon echo⟨/paste⟩\r`. `n` is the byte length of the encoded body
+/// `^U ⟨paste⟩stty -icanon -echo; head -c N | base64 -d [| gunzip] > 'path';
+/// stty icanon echo⟨/paste⟩\r`. `n` is the byte length of the encoded body
 /// (incl. `\n` per line). Caller then streams exactly `n` bytes. Caller
 /// frees.
-pub fn writeOpener(allocator: Allocator, path: []const u8, n: u64) ![]u8 {
+pub fn writeOpener(allocator: Allocator, path: []const u8, n: u64, gzip: bool) ![]u8 {
     const q = try posixQuote(allocator, path);
     defer allocator.free(q);
     return std.fmt.allocPrint(
         allocator,
         paste_open ++
-            "stty -icanon -echo; head -c {d} | base64 -d > {s}; stty icanon echo" ++
+            "stty -icanon -echo; head -c {d} | base64 -d{s} > {s}; stty icanon echo" ++
             paste_close,
-        .{ n, q },
+        .{ n, if (gzip) " | gunzip" else "", q },
     );
 }
 

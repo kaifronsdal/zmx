@@ -1,5 +1,6 @@
 if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
   typeset -g __ZMYTH_HOOK_V=1
+  typeset -g __ZMX_CAP=z$(command -v gunzip >/dev/null 2>&1 && printf g)
   zmodload zsh/datetime 2>/dev/null
   typeset -g __ZMX_RAN=0
   typeset -g __ZMX_T0=
@@ -19,7 +20,7 @@ if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
     fi
     __ZMX_RAN=0
     __ZMX_T0=
-    printf '\033]2718;done;%s;%d;%d;z;%s\007' "$$" "$__zmx_ec" "$dur" "$PWD"
+    printf '\033]2718;done;%s;%d;%d;%s;%s\007' "$$" "$__zmx_ec" "$dur" "$__ZMX_CAP" "$PWD"
   }
   autoload -Uz add-zsh-hook 2>/dev/null
   if typeset -f add-zsh-hook >/dev/null; then

@@ -766,15 +766,39 @@ pub fn wait(allocator: Allocator, args: []const [:0]const u8) !u8 {
     return agg;
 }
 
-/// read() until `buf` is full or EOF; returns bytes read.
-fn fillRead(fd: posix.fd_t, buf: []u8) !usize {
-    var n: usize = 0;
-    while (n < buf.len) {
-        const r = try posix.read(fd, buf[n..]);
-        if (r == 0) break;
-        n += r;
+const write_buffer_cap = 64 * 1024 * 1024;
+
+/// gzip-compress `raw` into an owned buffer, or null if `gzip` isn't on PATH.
+/// Zig 0.15.2's `std.compress.flate` compressor is unfinished (doesn't
+/// compile — mid-rewrite for the new Writer API), so shell out. A thread
+/// feeds stdin so a full stdout pipe can't deadlock us. Caller frees.
+fn gzipCompress(allocator: Allocator, raw: []const u8) !?[]u8 {
+    var child = std.process.Child.init(&.{ "gzip", "-c", "-1" }, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return null;
+
+    const Feeder = struct {
+        fn run(f: std.fs.File, data: []const u8) void {
+            f.writeAll(data) catch {};
+            f.close();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Feeder.run, .{ child.stdin.?, raw });
+    child.stdin = null; // thread owns it
+
+    var out = try std.ArrayList(u8).initCapacity(allocator, raw.len / 4 + 64);
+    errdefer out.deinit(allocator);
+    var tmp: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = child.stdout.?.read(&tmp) catch break;
+        if (n == 0) break;
+        try out.appendSlice(allocator, tmp[0..n]);
     }
-    return n;
+    t.join();
+    _ = child.wait() catch {};
+    return try out.toOwnedSlice(allocator);
 }
 
 pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
@@ -786,90 +810,73 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const path = args[1];
     if (validateNameOrFail(name, "write")) |rc| return rc;
 
-    // The daemon types `head -c N`, so it needs the encoded length up front.
-    // For a regular-file stdin we stat; for a pipe we have to buffer (capped).
-    const stdin = posix.STDIN_FILENO;
-    var pipe_buf: ?[]u8 = null;
-    defer if (pipe_buf) |b| allocator.free(b);
-    const raw_len: u64 = blk: {
-        const st = try posix.fstat(stdin);
-        if (posix.S.ISREG(st.mode)) break :blk @intCast(st.size);
-        const cap = 64 * 1024 * 1024;
-        var b = try std.ArrayList(u8).initCapacity(allocator, 64 * 1024);
+    // Buffer all of stdin: we must know both plain and gzip encoded lengths
+    // up front so the daemon can pick the opener. Nested-SSH writes are
+    // scripts/configs (KB–MB); cap at 64MB. Local-FS handles larger files
+    // at depth 0 (use scp for nested >64MB).
+    var raw: std.ArrayList(u8) = try .initCapacity(allocator, 64 * 1024);
+    defer raw.deinit(allocator);
+    {
         var tmp: [64 * 1024]u8 = undefined;
         while (true) {
-            const r = try posix.read(stdin, &tmp);
+            const r = try posix.read(posix.STDIN_FILENO, &tmp);
             if (r == 0) break;
-            if (b.items.len + r > cap) {
-                b.deinit(allocator);
-                errf("zmyth: write: piped stdin exceeds {d}MB; redirect from a file instead\n", .{cap >> 20});
+            if (raw.items.len + r > write_buffer_cap) {
+                errf("zmyth: write: stdin exceeds {d}MB\n", .{write_buffer_cap >> 20});
                 return 1;
             }
-            try b.appendSlice(allocator, tmp[0..r]);
+            try raw.appendSlice(allocator, tmp[0..r]);
         }
-        pipe_buf = try b.toOwnedSlice(allocator);
-        break :blk pipe_buf.?.len;
-    };
-    const enc_len = sh.writeEncLen(raw_len);
+    }
+
+    // Compress; report gz_enc_len=0 if it didn't shrink (incompressible) or
+    // gzip is unavailable, so the daemon picks plain even when the target
+    // has gunzip. Absolute paths at depth 0 take the local-FS shortcut and
+    // never use the gzip body, so skip the compress for those — at the cost
+    // of also skipping gzip for absolute paths into a *nested* layer (rare;
+    // falls back to plain, still correct).
+    const likely_local = path.len > 0 and (path[0] == '/' or std.mem.startsWith(u8, path, "~/"));
+    const gz_buf: []const u8 = if (likely_local)
+        ""
+    else
+        (try gzipCompress(allocator, raw.items)) orelse "";
+    defer allocator.free(gz_buf);
+    const plain_enc_len = sh.writeEncLen(raw.items.len);
+    const gz_enc_len: u64 = if (gz_buf.len > 0 and gz_buf.len < raw.items.len)
+        sh.writeEncLen(gz_buf.len)
+    else
+        0;
 
     const sock = connectOrFail(allocator, name, "write") orelse return 1;
     defer posix.close(sock);
 
     var hdr: std.ArrayList(u8) = .empty;
     defer hdr.deinit(allocator);
-    try hdr.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u64, enc_len)));
+    try hdr.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u64, plain_enc_len)));
+    try hdr.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u64, gz_enc_len)));
     try hdr.appendSlice(allocator, path);
     try ipc.sendBlocking(sock, .write_hdr, hdr.items);
-    {
+
+    const mode: u8 = blk: {
         const reply = try ipc.recvBlocking(allocator, sock);
         defer allocator.free(reply.payload);
         if (reply.tag == .err) {
             errf("zmyth: write: {s}\n", .{reply.payload});
             return 1;
         }
-        if (reply.tag != .ack) return 1;
-    }
+        if (reply.tag != .ack or reply.payload.len == 0) return 1;
+        break :blk reply.payload[0];
+    };
 
-    // Stream raw → base64 lines → .write_data, one ack per chunk (the ack
-    // is the daemon's backpressure signal — it defers while pty_input is
-    // backed up). 48 raw → 64 enc + '\n' per line; only complete 48-byte
-    // groups are encoded mid-stream so no `=` padding appears before EOF.
-    var raw: [48 * 1024]u8 = undefined;
-    var enc: [65 * 1024]u8 = undefined;
-    var pos: u64 = 0;
-    while (pos < raw_len) {
-        const want: usize = @intCast(@min(raw.len, raw_len - pos));
-        const got = if (pipe_buf) |b| blk: {
-            @memcpy(raw[0..want], b[@intCast(pos)..][0..want]);
-            break :blk want;
-        } else try fillRead(stdin, raw[0..want]);
-        if (got < want) {
-            errf("zmyth: write: stdin shrank (got {d} of {d})\n", .{ pos + got, raw_len });
-            return 1;
-        }
-        pos += got;
-        const last = pos == raw_len;
-
-        var w: usize = 0;
-        var off: usize = 0;
-        while (off < got) : (off += 48) {
-            const e = std.base64.standard.Encoder.encode(enc[w..], raw[off..@min(off + 48, got)]);
-            w += e.len;
-            enc[w] = '\n';
-            w += 1;
-        }
-        // The last short group encodes with '=' padding; mid-stream chunks
-        // are 48-aligned (want is a multiple of 48 unless it's the tail).
-        std.debug.assert(last or got % 48 == 0);
-
-        try ipc.sendBlocking(sock, .write_data, enc[0..w]);
-        const ack = try ipc.recvBlocking(allocator, sock);
-        defer allocator.free(ack.payload);
-        if (ack.tag != .ack) {
-            if (ack.tag == .err) errf("zmyth: write: {s}\n", .{ack.payload});
-            return 1;
-        }
-    }
+    // 'L' = daemon writes file directly (raw chunks). 'z'/'p' = PTY path
+    // (base64-encode gz_buf or raw respectively). One ack per chunk is the
+    // backpressure signal.
+    const body: []const u8 = switch (mode) {
+        'L', 'p' => raw.items,
+        'z' => gz_buf,
+        else => return 1,
+    };
+    try writeStream(allocator, sock, body, mode != 'L');
 
     try ipc.sendBlocking(sock, .write_data, "");
     const reply = try ipc.recvBlocking(allocator, sock);
@@ -879,6 +886,37 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
         return 1;
     }
     return if (reply.tag == .ack) 0 else 1;
+}
+
+/// Send `body` as `.write_data` chunks (raw or base64-encoded), waiting for
+/// `.ack` after each. 48 raw → 64 enc + '\n' per line; mid-stream chunks are
+/// 48-aligned so `=` padding appears only at EOF.
+fn writeStream(allocator: Allocator, sock: posix.fd_t, body: []const u8, b64: bool) !void {
+    var enc: [65 * 1024]u8 = undefined;
+    var pos: usize = 0;
+    while (pos < body.len) {
+        const take = @min(48 * 1024, body.len - pos);
+        const chunk = body[pos..][0..take];
+        pos += take;
+        const wire: []const u8 = if (!b64) chunk else blk: {
+            var w: usize = 0;
+            var off: usize = 0;
+            while (off < take) : (off += 48) {
+                const e = std.base64.standard.Encoder.encode(enc[w..], chunk[off..@min(off + 48, take)]);
+                w += e.len;
+                enc[w] = '\n';
+                w += 1;
+            }
+            break :blk enc[0..w];
+        };
+        try ipc.sendBlocking(sock, .write_data, wire);
+        const ack = try ipc.recvBlocking(allocator, sock);
+        defer allocator.free(ack.payload);
+        if (ack.tag != .ack) {
+            if (ack.tag == .err) errf("zmyth: write: {s}\n", .{ack.payload});
+            return error.WriteFailed;
+        }
+    }
 }
 
 pub fn kill(allocator: Allocator, args: []const [:0]const u8) !u8 {

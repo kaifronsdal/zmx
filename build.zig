@@ -142,6 +142,7 @@ pub fn build(b: *std.Build) void {
             "test/integration/headless_query.sh",
             "test/integration/hook_assets.sh",
             "test/integration/bugs.sh",
+            "test/integration/write_test.sh",
         }) |script| {
             itest_step.dependOn(&integrationTest(b, &install_exe2.step, bin_path, script).step);
         }
