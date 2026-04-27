@@ -9,7 +9,8 @@
 
 set -uo pipefail
 
-ZMX="${ZMYTH:-$(cd "$(dirname "$0")/../.." && pwd)/zig-out/bin/zmyth}"
+source "$(dirname "$0")/lib.sh"
+
 export ZMYTH_DIR=$(mktemp -d /tmp/zmyth-itest-XXXXXX)
 export XDG_STATE_HOME="$ZMYTH_DIR/state"
 unset ZMYTH_SESSION
@@ -20,25 +21,6 @@ export SHELL=${SHELL:-/bin/bash}
 # private ZMYTH_DIR, then remove the dir.
 trap '"$ZMX" kill -9 "*" 2>/dev/null; pkill -9 -f "$ZMYTH_DIR" 2>/dev/null; rm -rf "$ZMYTH_DIR"' EXIT
 
-PASS=0; FAIL=0
-ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
-bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
-check(){ if eval "$2"; then ok "$1"; else bad "$1  -- [$2]"; fi; }
-nuke() { for n in "$@"; do "$ZMX" kill -9 "$n" >/dev/null 2>&1; done; sleep 0.1; }
-
-[ -x "$ZMX" ] || { echo "FATAL: $ZMX not executable"; exit 1; }
-command -v jq >/dev/null || { echo "FATAL: jq required"; exit 1; }
-
-# ── Portability shims (macOS/BSD) ───────────────────────────────────────────
-# `timeout` is GNU-coreutils-only; macOS lacks it unless coreutils is brewed.
-# perl is always present on macOS, so alarm+exec gives us a drop-in for the
-# `timeout N cmd args...` form used below (no flags, integer seconds).
-if ! command -v timeout >/dev/null; then
-  timeout() { perl -e 'alarm shift; exec @ARGV' -- "$@"; }
-fi
-# `stat -c %a` is GNU; BSD stat spells it `-f %Lp`.
-sock_perms() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
-
 # Helper: extract a field from the trailing -j line of `run` output.
 # Usage: jrun <field> <args...>   (echoes field value, returns run's ec)
 jrun() {
@@ -48,18 +30,14 @@ jrun() {
   return $ec
 }
 
-# Helper: monotonic ms. BSD date has no %N, so use python3 (already required
-# for scenarios 33/36 and attach_test.py).
-now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Basic exit codes (bash). Auto-creates session.
 # ─────────────────────────────────────────────────────────────────────────────
-"$ZMX" run -j t1 -- 'true' >/dev/null;     check "01a run true ec=0"    "[ $? -eq 0 ]"
-"$ZMX" run -j t1 -- '(exit 42)' >/dev/null; check "01b run (exit 42)"   "[ $? -eq 42 ]"
-"$ZMX" run -j t1 -- false >/dev/null;      check "01c run false ec=1"   "[ $? -eq 1 ]"
+"$ZMX" run -j t1 -- 'true' >/dev/null;     chk "01a run true ec=0"    "[ $? -eq 0 ]"
+"$ZMX" run -j t1 -- '(exit 42)' >/dev/null; chk "01b run (exit 42)"   "[ $? -eq 42 ]"
+"$ZMX" run -j t1 -- false >/dev/null;      chk "01c run false ec=1"   "[ $? -eq 1 ]"
 via=$(jrun via t1 -- 'true')
-check "01d exit-code via osc_done (hooks active)" "[ '$via' = osc_done ]"
+chk "01d exit-code via osc_done (hooks active)" "[ '$via' = osc_done ]"
 nuke t1
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,18 +45,18 @@ nuke t1
 # ─────────────────────────────────────────────────────────────────────────────
 if command -v zsh >/dev/null; then
   SHELL=$(command -v zsh) "$ZMX" run -j tz -- '(exit 17)' >/dev/null
-  check "02a zsh (exit 17)" "[ $? -eq 17 ]"
+  chk "02a zsh (exit 17)" "[ $? -eq 17 ]"
   via=$(SHELL=$(command -v zsh) jrun via tz -- 'true')
-  check "02b zsh hooked (osc_done)" "[ '$via' = osc_done ]"
+  chk "02b zsh hooked (osc_done)" "[ '$via' = osc_done ]"
   nuke tz
 else
   echo "SKIP: 02a/02b (zsh not installed)"
 fi
 if command -v fish >/dev/null; then
   SHELL=$(command -v fish) "$ZMX" run -j tf -- 'false' >/dev/null
-  check "02c fish false ec=1" "[ $? -eq 1 ]"
+  chk "02c fish false ec=1" "[ $? -eq 1 ]"
   via=$(SHELL=$(command -v fish) jrun via tf -- 'true')
-  check "02d fish hooked (osc_done)" "[ '$via' = osc_done ]"
+  chk "02d fish hooked (osc_done)" "[ '$via' = osc_done ]"
   nuke tf
 else
   echo "SKIP: 02c/02d (fish not installed)"
@@ -90,10 +68,10 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run t3 -- 'true' >/dev/null
 "$ZMX" run t3 -- 'echo ZMX_TASK_COMPLETED:99' >/dev/null
-check "03a legacy marker string is inert (ec=0, not 99)" "[ $? -eq 0 ]"
+chk "03a legacy marker string is inert (ec=0, not 99)" "[ $? -eq 0 ]"
 out=$("$ZMX" read t3 -n 5)
-check "03b OSC 2718 swallowed from scrollback" "! grep -q 2718 <<<\"\$out\""
-check "03c command output preserved" "grep -q 'ZMX_TASK_COMPLETED:99' <<<\"\$out\""
+chk "03b OSC 2718 swallowed from scrollback" "! grep -q 2718 <<<\"\$out\""
+chk "03c command output preserved" "grep -q 'ZMX_TASK_COMPLETED:99' <<<\"\$out\""
 nuke t3
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,29 +79,29 @@ nuke t3
 #    from waitpid, not lost.
 # ─────────────────────────────────────────────────────────────────────────────
 via=$(jrun via te -- 'exit 7'); ec=$?
-check "04a exit 7 -> ec=7"       "[ $ec -eq 7 ]"
-check "04b exit 7 -> via=pty_eof" "[ '$via' = pty_eof ]"
+chk "04a exit 7 -> ec=7"       "[ $ec -eq 7 ]"
+chk "04b exit 7 -> via=pty_eof" "[ '$via' = pty_eof ]"
 # session should be gone
 "$ZMX" ls -q | grep -qx te
-check "04c session removed after shell exit" "[ $? -ne 0 ]"
+chk "04c session removed after shell exit" "[ $? -ne 0 ]"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. `run` arg parsing (#01,#09 fix): everything after `--` is the command,
 #    even if it looks like a flag.
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run t5 -- -d >/dev/null 2>&1; ec=$?
-check "05a '-- -d' treated as command (ec=127, not 0)" "[ $ec -eq 127 ]"
+chk "05a '-- -d' treated as command (ec=127, not 0)" "[ $ec -eq 127 ]"
 "$ZMX" run -d t5 -- 'true' >/dev/null; ec=$?
-check "05b '-d' before name parsed as flag" "[ $ec -eq 0 ]"
+chk "05b '-d' before name parsed as flag" "[ $ec -eq 0 ]"
 err=$("$ZMX" run t5 'true' 2>&1 >/dev/null); ec=$?
-check "05c missing -- rejected" "[ $ec -eq 2 ] && grep -q -- '--' <<<\"\$err\""
+chk "05c missing -- rejected" "[ $ec -eq 2 ] && grep -q -- '--' <<<\"\$err\""
 nuke t5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. kill nonexistent (#02 fix)
 # ─────────────────────────────────────────────────────────────────────────────
 err=$("$ZMX" kill nonesuch 2>&1); ec=$?
-check "06  kill nonexistent -> ec!=0 + 'no such'" \
+chk "06  kill nonexistent -> ec!=0 + 'no such'" \
       "[ $ec -ne 0 ] && grep -qi 'no such' <<<\"\$err\""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,9 +109,9 @@ check "06  kill nonexistent -> ec!=0 + 'no such'" \
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run t7 -- 'true' >/dev/null
 "$ZMX" ls -j | jq -e '.[0] | has("name") and has("pid") and has("hooked") and has("cwd")' >/dev/null
-check "07a ls -j has name/pid/hooked/cwd" "[ $? -eq 0 ]"
+chk "07a ls -j has name/pid/hooked/cwd" "[ $? -eq 0 ]"
 "$ZMX" ls -j | jq -e '.[] | select(.name=="t7") | .last_exit == 0' >/dev/null
-check "07b ls -j last_exit reflects last run" "[ $? -eq 0 ]"
+chk "07b ls -j last_exit reflects last run" "[ $? -eq 0 ]"
 nuke t7
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,7 +119,7 @@ nuke t7
 # ─────────────────────────────────────────────────────────────────────────────
 for s in p1 p2 p3 p4 p5; do "$ZMX" run "$s" -- true >/dev/null; done
 t0=$(now_ms); "$ZMX" ls >/dev/null; t1=$(now_ms)
-check "08  ls over 5 sessions < 1000ms (got $((t1-t0))ms)" "[ $((t1-t0)) -lt 1000 ]"
+chk "08  ls over 5 sessions < 1000ms (got $((t1-t0))ms)" "[ $((t1-t0)) -lt 1000 ]"
 nuke p1 p2 p3 p4 p5
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,7 +130,7 @@ nuke p1 p2 p3 p4 p5
 printf 'echo SEND-%s-OK\r' "$$" | "$ZMX" send t9 -
 sleep 0.3
 "$ZMX" read t9 -n 5 | grep -qE "^SEND-$$-OK"
-check "09  send + read round-trip (executed, not just echoed)" "[ $? -eq 0 ]"
+chk "09  send + read round-trip (executed, not just echoed)" "[ $? -eq 0 ]"
 nuke t9
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,7 +138,7 @@ nuke t9
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run t10 -- 'echo SCREEN-MARKER' >/dev/null
 "$ZMX" read t10 -s | grep -q SCREEN-MARKER
-check "10  read -s contains SCREEN-MARKER" "[ $? -eq 0 ]"
+chk "10  read -s contains SCREEN-MARKER" "[ $? -eq 0 ]"
 nuke t10
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,13 +146,13 @@ nuke t10
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run t11 -- 'true' >/dev/null
 "$ZMX" mv t11 renamed11; ec=$?
-check "11a mv ec=0" "[ $ec -eq 0 ]"
+chk "11a mv ec=0" "[ $ec -eq 0 ]"
 "$ZMX" ls -q | grep -qx renamed11
-check "11b ls shows new name" "[ $? -eq 0 ]"
+chk "11b ls shows new name" "[ $? -eq 0 ]"
 "$ZMX" ls -q | grep -qx t11
-check "11c ls no longer shows old name" "[ $? -ne 0 ]"
+chk "11c ls no longer shows old name" "[ $? -ne 0 ]"
 "$ZMX" run renamed11 -- 'true' >/dev/null
-check "11d run on renamed session works" "[ $? -eq 0 ]"
+chk "11d run on renamed session works" "[ $? -eq 0 ]"
 nuke renamed11
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,7 +162,7 @@ nuke renamed11
 "$ZMX" run g-b -- true >/dev/null
 "$ZMX" kill -9 'g-*'; sleep 0.3
 left=$("$ZMX" ls -q | grep -c '^g-' || true)
-check "12a kill -9 'g-*' removes both" "[ $left -eq 0 ]"
+chk "12a kill -9 'g-*' removes both" "[ $left -eq 0 ]"
 
 # BUG: zmyth kill (SIGTERM) sends the signal to the interactive shell, which
 # ignores SIGTERM. Daemon should either SIGHUP the shell, close the PTY
@@ -192,7 +170,7 @@ check "12a kill -9 'g-*' removes both" "[ $left -eq 0 ]"
 "$ZMX" run g-c -- true >/dev/null
 "$ZMX" kill g-c; sleep 0.5
 "$ZMX" ls -q | grep -qx g-c
-check "12b kill (SIGTERM) terminates session" "[ $? -ne 0 ]"
+chk "12b kill (SIGTERM) terminates session" "[ $? -ne 0 ]"
 nuke g-c
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,7 +179,7 @@ nuke g-c
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run t13 -- true >/dev/null   # warm: get hooks installed first
 ec_json=$(jrun exit_code t13 -- 'head -c 100000 /dev/urandom | base64; (exit 13)'); ec=$?
-check "13  large output -> ec=13 (json=$ec_json)" "[ $ec -eq 13 ] && [ '$ec_json' = 13 ]"
+chk "13  large output -> ec=13 (json=$ec_json)" "[ $ec -eq 13 ] && [ '$ec_json' = 13 ]"
 nuke t13
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,7 +187,7 @@ nuke t13
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run t14 -- true >/dev/null
 t0=$(now_ms); "$ZMX" run -j t14 -- 'sleep 5 &' >/dev/null; ec=$?; t1=$(now_ms)
-check "14  'sleep 5 &' ec=0 in <1000ms (got $((t1-t0))ms)" \
+chk "14  'sleep 5 &' ec=0 in <1000ms (got $((t1-t0))ms)" \
       "[ $ec -eq 0 ] && [ $((t1-t0)) -lt 1000 ]"
 nuke t14
 
@@ -218,11 +196,11 @@ nuke t14
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run t15 -- true >/dev/null
 "$ZMX" run -d t15 -- 'sleep 10'
-sleep 0.3
+wait_for t15 '.[]|select(.name==$n and .cmd_running)'
 printf '\x03' | "$ZMX" send t15 -
-sleep 0.5
-last=$("$ZMX" ls -j | jq '.[] | select(.name=="t15") | .last_exit')
-check "15  Ctrl-C -> last_exit=130 (got $last)" "[ '$last' = 130 ]"
+wait_for t15 '.[]|select(.name==$n and (.cmd_running|not))'
+last=$(jget t15 last_exit)
+chk "15  Ctrl-C -> last_exit=130 (got $last)" "[ '$last' = 130 ]"
 nuke t15
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,7 +213,7 @@ tmp=$(mktemp)
 wait
 got5=$(jq -r .exit_code <"$tmp" | grep -cx 5 || true)
 got6=$(jq -r .exit_code <"$tmp" | grep -cx 6 || true)
-check "16  concurrent runs -> both ec=5 and ec=6 reported" \
+chk "16  concurrent runs -> both ec=5 and ec=6 reported" \
       "[ $got5 -eq 1 ] && [ $got6 -eq 1 ]"
 rm -f "$tmp"
 nuke t16
@@ -244,22 +222,22 @@ nuke t16
 # 17. Invalid session name rejected.
 # ─────────────────────────────────────────────────────────────────────────────
 err=$("$ZMX" run '../etc' -- true 2>&1); ec=$?
-check "17a invalid name '../etc' -> ec=2 + 'invalid'" \
+chk "17a invalid name '../etc' -> ec=2 + 'invalid'" \
       "[ $ec -eq 2 ] && grep -qi invalid <<<\"\$err\""
 err=$("$ZMX" run 'a b' -- true 2>&1); ec=$?
-check "17b invalid name 'a b' -> ec=2" "[ $ec -eq 2 ]"
+chk "17b invalid name 'a b' -> ec=2" "[ $ec -eq 2 ]"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 18. help / version / unknown verb
 # ─────────────────────────────────────────────────────────────────────────────
 out=$("$ZMX" version); ec=$?
-check "18a version ec=0 contains 'zmyth'" "[ $ec -eq 0 ] && grep -q zmyth <<<\"\$out\""
+chk "18a version ec=0 contains 'zmyth'" "[ $ec -eq 0 ] && grep -q zmyth <<<\"\$out\""
 "$ZMX" help >/dev/null
-check "18b help ec=0" "[ $? -eq 0 ]"
+chk "18b help ec=0" "[ $? -eq 0 ]"
 "$ZMX" bogusverb >/dev/null 2>&1
-check "18c unknown verb ec=2" "[ $? -eq 2 ]"
+chk "18c unknown verb ec=2" "[ $? -eq 2 ]"
 "$ZMX" >/dev/null 2>&1
-check "18d no args ec=2" "[ $? -eq 2 ]"
+chk "18d no args ec=2" "[ $? -eq 2 ]"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 19. fish backslash arg (#17 fix): trailing \ in arg no longer hangs.
@@ -269,7 +247,7 @@ if command -v fish >/dev/null; then
   # fish accepts as an escaped backslash and executes via osc_done).
   out=$(SHELL=$(command -v fish) timeout 10 "$ZMX" run -j tfq -- $'printf %s foo\\' 2>/dev/null); ec=$?
   via=$(tail -n1 <<<"$out" | jq -r .via 2>/dev/null)
-  check "19  fish trailing-\\ -> line_rejected (no hang; via=$via)" \
+  chk "19  fish trailing-\\ -> line_rejected (no hang; via=$via)" \
         "[ $ec -ne 124 ] && [ '$via' = line_rejected ]"
   nuke tfq
 else
@@ -283,8 +261,8 @@ fi
 dst=/tmp/zmyth-write-test.txt; rm -f "$dst"
 echo "hello write" | "$ZMX" write t20 "$dst"; ec=$?
 sleep 0.3
-check "20a write ec=0" "[ $ec -eq 0 ]"
-check "20b write text round-trip" "[ \"\$(cat '$dst' 2>/dev/null)\" = 'hello write' ]"
+chk "20a write ec=0" "[ $ec -eq 0 ]"
+chk "20b write text round-trip" "[ \"\$(cat '$dst' 2>/dev/null)\" = 'hello write' ]"
 rm -f "$dst"
 nuke t20
 
@@ -297,7 +275,7 @@ head -c 10240 /dev/urandom > "$src"
 "$ZMX" write t21 "$dst" < "$src"
 sleep 1
 diff -q "$src" "$dst" >/dev/null 2>&1
-check "21  write 10KB binary round-trip" "[ $? -eq 0 ]"
+chk "21  write 10KB binary round-trip" "[ $? -eq 0 ]"
 rm -f "$src" "$dst"
 nuke t21
 
@@ -308,12 +286,12 @@ nuke t21
 "$ZMX" run -d t22 -- 'sleep 0.5; (exit 9)'
 sleep 0.1
 t0=$(now_ms); "$ZMX" wait t22; ec=$?; t1=$(now_ms)
-check "22a wait returns ec=9" "[ $ec -eq 9 ]"
-check "22b wait actually blocked (~400ms, got $((t1-t0))ms)" \
+chk "22a wait returns ec=9" "[ $ec -eq 9 ]"
+chk "22b wait actually blocked (~400ms, got $((t1-t0))ms)" \
       "[ $((t1-t0)) -gt 250 ] && [ $((t1-t0)) -lt 2000 ]"
 # Idle session: wait returns immediately with last_exit.
 t0=$(now_ms); "$ZMX" wait t22; ec=$?; t1=$(now_ms)
-check "22c wait on idle returns immediately ec=9 (got $((t1-t0))ms)" \
+chk "22c wait on idle returns immediately ec=9 (got $((t1-t0))ms)" \
       "[ $ec -eq 9 ] && [ $((t1-t0)) -lt 200 ]"
 nuke t22
 
@@ -325,9 +303,9 @@ wait
 a_ec=$(grep -ao '{"exit_code":[^}]*}' "$ZMYTH_DIR/r23a" | jq -r .exit_code 2>/dev/null)
 b_ec=$(grep -ao '{"exit_code":[^}]*}' "$ZMYTH_DIR/r23b" | jq -r .exit_code 2>/dev/null)
 locks=$(grep -c 'lock acquired' "$XDG_STATE_HOME/zmyth/race23.log" 2>/dev/null || echo 0)
-check "23a race: both runs completed (got $a_ec,$b_ec)" \
+chk "23a race: both runs completed (got $a_ec,$b_ec)" \
   "[[ '$a_ec $b_ec' == '3 4' || '$a_ec $b_ec' == '4 3' ]]"
-check "23b race: exactly one daemon won lock (got $locks)" "[[ $locks -eq 1 ]]"
+chk "23b race: exactly one daemon won lock (got $locks)" "[[ $locks -eq 1 ]]"
 nuke race23
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -341,7 +319,7 @@ sleep 0.2
 sleep 0.3
 kill "$fpid" 2>/dev/null; wait "$fpid" 2>/dev/null
 grep -q FOLLOW-MARK "$ZMYTH_DIR/follow.out"
-check "24  read -f streams new output" "[ $? -eq 0 ]"
+chk "24  read -f streams new output" "[ $? -eq 0 ]"
 nuke t24
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -353,9 +331,9 @@ nuke t24
 "$ZMX" run m-a -- true >/dev/null
 "$ZMX" run m-b -- true >/dev/null
 "$ZMX" mv m-a m-b >/dev/null 2>&1; ec=$?
-check "25a mv onto existing name -> ec!=0" "[ $ec -ne 0 ]"
+chk "25a mv onto existing name -> ec!=0" "[ $ec -ne 0 ]"
 "$ZMX" ls -q | grep -qx m-a
-check "25b source session still present" "[ $? -eq 0 ]"
+chk "25b source session still present" "[ $? -eq 0 ]"
 nuke m-a m-b
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -365,16 +343,18 @@ nuke m-a m-b
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run -j tord -- 'echo BEFORE-JSON' >"$ZMYTH_DIR/ord.out" 2>&1
 tail -1 "$ZMYTH_DIR/ord.out" | jq -e '.exit_code == 0' >/dev/null
-check "26a run -j: last line is JSON exit_code=0" "[ $? -eq 0 ]"
+chk "26a run -j: last line is JSON exit_code=0" "[ $? -eq 0 ]"
 grep -q BEFORE-JSON "$ZMYTH_DIR/ord.out"
-check "26b run -j: command output present before JSON" "[ $? -eq 0 ]"
+chk "26b run -j: command output present before JSON" "[ $? -eq 0 ]"
 nuke tord
 
 # ── 27: attach (PTY harness) ────────────────────────────────────────────────
-if python3 "$(dirname "$0")/attach_test.py" >"$ZMYTH_DIR/attach.log" 2>&1; then
-  ok "27  attach pty harness (8 sub-checks)"
+python3 "$(dirname "$0")/attach_test.py" >"$ZMYTH_DIR/attach.log" 2>&1; ec=$?
+sub=$(tail -1 "$ZMYTH_DIR/attach.log")
+if [ $ec -eq 0 ]; then
+  ok "27  attach pty harness ($sub)"
 else
-  bad "27  attach pty harness"; cat "$ZMYTH_DIR/attach.log"
+  bad "27  attach pty harness ($sub)"; cat "$ZMYTH_DIR/attach.log"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -386,7 +366,7 @@ fi
 #     crashing on the missing HOME/XDG_STATE_HOME lookup.
 # ─────────────────────────────────────────────────────────────────────────────
 env -u HOME -u XDG_STATE_HOME ZMYTH_DIR="$ZMYTH_DIR" "$ZMX" run -j h30 -- true >/dev/null 2>&1
-check "30  HOME unset -> ec=0 (stateDir falls back)" "[ $? -eq 0 ]"
+chk "30  HOME unset -> ec=0 (stateDir falls back)" "[ $? -eq 0 ]"
 nuke h30
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -394,7 +374,7 @@ nuke h30
 #     diagnostic (DaemonStartTimeout), not the misleading legacy NoSuchSession.
 # ─────────────────────────────────────────────────────────────────────────────
 err=$(SHELL=/nonexistent "$ZMX" run -j h31 -- true 2>&1); ec=$?
-check "31  SHELL=/nonexistent -> ec!=0, informative error (got: $err)" \
+chk "31  SHELL=/nonexistent -> ec!=0, informative error (got: $err)" \
       "[ $ec -ne 0 ] && ! grep -qi 'NoSuchSession' <<<\"\$err\""
 nuke h31
 
@@ -405,8 +385,8 @@ nuke h31
 # ─────────────────────────────────────────────────────────────────────────────
 if command -v dash >/dev/null; then
   err=$(SHELL=$(command -v dash) timeout 5 "$ZMX" run -j h32 -- true 2>&1 >/dev/null); ec=$?
-  check "32a SHELL=dash -> run rejected fast (ec=125, not hang)" "[ $ec -eq 125 ]"
-  check "32b error mentions 'shell integration unavailable'" \
+  chk "32a SHELL=dash -> run rejected fast (ec=125, not hang)" "[ $ec -eq 125 ]"
+  chk "32b error mentions 'shell integration unavailable'" \
     "grep -qi 'integration unavailable' <<<\"\$err\""
   nuke h32
 else
@@ -419,7 +399,7 @@ fi
 #     fails to bind and surfacing only DaemonStartTimeout.
 # ─────────────────────────────────────────────────────────────────────────────
 err=$(ZMYTH_DIR="$ZMYTH_DIR/$(python3 -c 'print("x"*90)')" "$ZMX" run h33 -- true 2>&1); ec=$?
-check "33  socket path >108 -> ec!=0, mentions length/long/path (got: $err)" \
+chk "33  socket path >108 -> ec!=0, mentions length/long/path (got: $err)" \
       "[ $ec -ne 0 ] && grep -qiE 'length|long|path' <<<\"\$err\""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -428,7 +408,7 @@ check "33  socket path >108 -> ec!=0, mentions length/long/path (got: $err)" \
 # ─────────────────────────────────────────────────────────────────────────────
 ( umask 000; "$ZMX" run h34 -- true >/dev/null 2>&1 )
 perm=$(sock_perms "$ZMYTH_DIR/h34.sock" 2>/dev/null || echo 999)
-check "34  umask 000 -> socket perms <=700 (got $perm)" "[ '$perm' -le 700 ]"
+chk "34  umask 000 -> socket perms <=700 (got $perm)" "[ '$perm' -le 700 ]"
 nuke h34
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -438,7 +418,7 @@ nuke h34
 #     ReleaseSafe), so the size is tuned to complete in <15s under Debug.
 # ─────────────────────────────────────────────────────────────────────────────
 timeout 30 "$ZMX" run -j h35 -- 'head -c 500000 /dev/zero | tr "\0" x; (exit 13)' >/dev/null 2>&1
-check "35  500KB output -> ec=13" "[ $? -eq 13 ]"
+chk "35  500KB output -> ec=13" "[ $? -eq 13 ]"
 nuke h35
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -461,10 +441,10 @@ time.sleep(30)
 hogpid=$!
 for _ in $(seq 50); do grep -q READY "$ZMYTH_DIR/h36.ready" 2>/dev/null && break; sleep 0.1; done
 timeout 5 "$ZMX" run h36 -- true >/dev/null 2>&1; ec=$?
-check "36a max_clients saturated -> run rejected (ec!=0)" "[ $ec -ne 0 ]"
+chk "36a max_clients saturated -> run rejected (ec!=0)" "[ $ec -ne 0 ]"
 kill "$hogpid" 2>/dev/null; wait "$hogpid" 2>/dev/null; sleep 0.3
 timeout 5 "$ZMX" run h36 -- true >/dev/null 2>&1; ec=$?
-check "36b connections released -> run succeeds" "[ $ec -eq 0 ]"
+chk "36b connections released -> run succeeds" "[ $ec -eq 0 ]"
 nuke h36
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -486,7 +466,7 @@ if [ "$BASH_MAJOR" -ge 4 ]; then
   printf '\033' | "$ZMX" send h37 -   # ESC -> readline vi NORMAL mode
   sleep 0.6                           # > readline keyseq-timeout (500ms)
   timeout 10 "$ZMX" run -j h37 -- '(exit 7)' >/dev/null
-  check "37  bash vi-mode, prompt in NORMAL -> run ec=7" "[ $? -eq 7 ]"
+  chk "37  bash vi-mode, prompt in NORMAL -> run ec=7" "[ $? -eq 7 ]"
   rm -rf "$home37"; nuke h37
 else
   echo "SKIP: 37 (bash $BASH_MAJOR.x lacks bracketed-paste; need >=4)"
@@ -502,7 +482,7 @@ if [ "$BASH_MAJOR" -ge 4 ]; then
   home38=$(mktemp -d)
   printf "bind 'set enable-bracketed-paste off'\n" >"$home38/.bashrc"
   via=$(HOME="$home38" SHELL="$BASH_BIN" jrun via h38 -- '(exit 3)'); ec=$?
-  check "38  bash enable-bracketed-paste off -> run ec=3 via osc_done" \
+  chk "38  bash enable-bracketed-paste off -> run ec=3 via osc_done" \
         "[ $ec -eq 3 ] && [ '$via' = osc_done ]"
   rm -rf "$home38"; nuke h38
 else

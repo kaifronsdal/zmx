@@ -4,17 +4,14 @@
 # ghostty's shadow terminal answers and the read returns immediately.
 set -u
 
-ZMYTH=${ZMYTH:-./zig-out/bin/zmyth}
+source "$(dirname "$0")/lib.sh"
+
 ROOT=$(mktemp -d /tmp/zmyth_hq.XXXXXX)
 export HOME="$ROOT/home" ZMYTH_DIR="$ROOT/run"
 mkdir -p "$HOME" "$ZMYTH_DIR"
-PASS=0; FAIL=0
-ok()  { PASS=$((PASS+1)); printf "  \033[32m✓\033[0m %s\n" "$1"; }
-bad() { FAIL=$((FAIL+1)); printf "  \033[31m✗\033[0m %s\n    got: %s\n" "$1" "$2"; }
 
 cleanup() { "$ZMYTH" kill hq -9 2>/dev/null; rm -rf "$ROOT"; }
 trap cleanup EXIT
-[ -x "$ZMYTH" ] || { echo "FATAL: $ZMYTH not found"; exit 1; }
 
 # A tiny prober: emit \e[6n to /dev/tty, read the reply from /dev/tty with a
 # 1.5s timeout, report whether a reply arrived and how long it took.

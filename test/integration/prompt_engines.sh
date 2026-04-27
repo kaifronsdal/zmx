@@ -13,15 +13,13 @@
 
 set -uo pipefail
 
-ZMX="${ZMYTH:-$(cd "$(dirname "$0")/../.." && pwd)/zig-out/bin/zmyth}"
+source "$(dirname "$0")/lib.sh"
+
 export ZMYTH_DIR=$(mktemp -d /tmp/zmyth-pe-itest-XXXXXX)
 export XDG_STATE_HOME="$ZMYTH_DIR/state"
 unset ZMYTH_SESSION ZDOTDIR
 
 trap '"$ZMX" kill -9 "*" 2>/dev/null; pkill -9 -f "$ZMYTH_DIR" 2>/dev/null; rm -rf "$ZMYTH_DIR"' EXIT
-
-[ -x "$ZMX" ] || { echo "FATAL: $ZMX not executable"; exit 1; }
-command -v jq >/dev/null || { echo "FATAL: jq required"; exit 1; }
 
 # ── locate / install prompt engines ─────────────────────────────────────────
 # Prefer PATH; fall back to /tmp/zmyth-pe (and /tmp/bin where the PoC put
@@ -55,11 +53,8 @@ ensure_starship && HAVE[starship]=1 || echo "SKIP engine: starship (install fail
 ensure_omp      && HAVE[omp]=1      || echo "SKIP engine: oh-my-posh (install failed / unavailable)"
 
 # ── bookkeeping ─────────────────────────────────────────────────────────────
-PASS=0; FAIL=0; SKIP=0
+SKIP=0
 declare -A CELL   # CELL[shell,engine] = PASS|FAIL|SKIP|<detail>
-ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
-bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
-nuke() { for n in "$@"; do "$ZMX" kill -9 "$n" >/dev/null 2>&1; done; sleep 0.1; }
 
 # Write the engine's init line for $shell into the rc file zmyth's shim will
 # source: ~/.bashrc, ~/.zshrc, ~/.config/fish/config.fish (see src2/spawn.zig).

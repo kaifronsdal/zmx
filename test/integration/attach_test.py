@@ -53,18 +53,6 @@ def check(label, cond, extra=""):
         bad(f"{label}  {extra}")
 
 
-def check_bug(label, cond, extra=""):
-    """Assertion for a known zmyth defect. Condition describes CORRECT
-    behaviour; failing is expected (XFAIL) until src2/ is fixed, passing
-    is XPASS. Neither outcome flips the suite's exit code."""
-    global PASS
-    if cond:
-        PASS += 1
-        print(f"XPASS: {label}")
-    else:
-        print(f"XFAIL: {label}  {extra}")
-
-
 def set_winsize(fd, rows, cols):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
