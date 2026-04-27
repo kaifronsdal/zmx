@@ -471,6 +471,29 @@ test "probe: fish" {
     try testing.expectEqual(@as(u32, 3), ev.probe.shell_major);
 }
 
+test "B1: unterminated OSC immediately followed by OSC 2718 — inner not lost" {
+    // Real VT parsers abort an OSC on bare ESC (not just ESC[). We currently
+    // only abort on `\e[`, so `\e] junk \e]2718;...` treats the whole thing as
+    // one OSC body that doesn't start with `2718;` → event lost.
+    var s = Scanner.init(testing.allocator);
+    defer s.deinit();
+    const ev = (try collectOne(&s, "\x1b]garbage\x1b]2718;preexec;42\x07")) orelse
+        return error.InnerOscLost;
+    try testing.expectEqual(@as(i32, 42), ev.preexec);
+}
+
+test "B2: CSI inside a *terminated* OSC payload not mistaken for abort" {
+    // OSC 0 title containing literal `\e[?2004h` text — the OSC is properly
+    // BEL-terminated, so the CSI-abort heuristic must not fire and emit a
+    // spurious .prompt.
+    var s = Scanner.init(testing.allocator);
+    defer s.deinit();
+    var evs: std.ArrayList(Event) = .empty;
+    defer evs.deinit(testing.allocator);
+    try s.feed("\x1b]0;title-with-\x1b[?2004h-in-it\x07", &evs);
+    try testing.expectEqual(@as(usize, 0), evs.items.len);
+}
+
 test "OSC 7 (pwd) parsed" {
     var s = Scanner.init(testing.allocator);
     defer s.deinit();

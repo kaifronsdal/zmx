@@ -18,8 +18,8 @@ if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
     if [[ -n "$__ZMX_T0" ]]; then
       local t1=${EPOCHREALTIME:-}
       if [[ -n "$t1" ]]; then
-        local s0=${__ZMX_T0%.*} u0=${__ZMX_T0#*.}000000
-        local s1=${t1%.*} u1=${t1#*.}000000
+        local s0=${__ZMX_T0%[.,]*} u0=${__ZMX_T0#*[.,]}000000
+        local s1=${t1%[.,]*} u1=${t1#*[.,]}000000
         dur=$(( (10#$s1 - 10#$s0) * 1000 + (10#${u1:0:6} - 10#${u0:0:6}) / 1000 ))
         (( dur < 0 )) && dur=0
       fi

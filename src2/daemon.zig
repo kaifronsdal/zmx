@@ -709,19 +709,18 @@ fn reapClosedClients(d: *Daemon) void {
         posix.close(c.fd);
         _ = d.clients.swapRemove(i);
     }
-    // Promote a new leader if the old one was reaped or demoted. Prefer a
-    // client that's actually draining; a backlog-demoted client must not be
-    // immediately re-elected.
+    // Promote a new leader if the old one was reaped or demoted. Only a
+    // client that's actually draining is eligible — re-electing a backlog-
+    // demoted client would demote→re-elect→resize+SIGWINCH every poll tick.
+    // With no eligible client, leave leader_id null: the PTY stays at its
+    // last size until a healthy client appears or types (handleInput).
     if (d.leader_id == null) {
-        var fallback: ?*Client = null;
-        for (d.clients.items) |*nc| if (nc.attached and !nc.closed) {
-            if (nc.framer.pendingWrite().len <= leader_demote_backlog) {
-                fallback = nc;
-                break;
-            }
-            if (fallback == null) fallback = nc;
+        for (d.clients.items) |*nc| if (nc.attached and !nc.closed and
+            nc.framer.pendingWrite().len <= leader_demote_backlog)
+        {
+            d.promoteLeader(nc);
+            break;
         };
-        if (fallback) |nc| d.promoteLeader(nc);
     }
 }
 
@@ -1002,7 +1001,10 @@ fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
     }
     // Empty payload = EOF: close heredoc, end paste, submit.
     var buf: [32]u8 = undefined;
-    const closer = std.fmt.bufPrint(&buf, "{s}\x1b[201~\r", .{&ws.delim}) catch unreachable;
+    // Leading \n: the heredoc delimiter must be on its own line. The current
+    // client always ends each base64 chunk with \n, but a future/alternate
+    // client might not — match the reaper's closer (line ~704) for robustness.
+    const closer = std.fmt.bufPrint(&buf, "\n{s}\x1b[201~\r", .{&ws.delim}) catch unreachable;
     try d.session.queueSend(closer);
     d.write_state = null;
     try c.framer.queue(.ack, "");

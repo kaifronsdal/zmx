@@ -1317,6 +1317,69 @@ test "two hellos before first done: second inject's echo not misattributed" {
     try testing.expectEqual(@as(?i32, 7), s.completions()[0].result.exit_code);
 }
 
+test "B6: late inject-done after force-clear must not complete user's run" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    // Nested layer hellos; inject queued, but its done is delayed past 5s.
+    var b: [128]u8 = undefined;
+    try s.feedPtyOutput(std.fmt.bufPrint(&b, "\x1b]2718;hello;bash;{d}\x07", .{TPID}) catch unreachable);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try testing.expectEqual(@as(u8, 1), s.top().?.inject_pending);
+
+    try s.queueRun(5, "echo hi", false);
+    const t0 = s.run_queue.items[0].queued_ns;
+
+    // Force-clear at 5s → request typed.
+    _ = s.checkPromptWait(t0 + 6 * std.time.ns_per_s);
+    try testing.expect(s.run_queue.items[0].sent);
+    s.consumePtyInput(s.pendingPtyInput().len);
+
+    // Now the LATE inject done arrives (the one we force-cleared the counter
+    // for). It must NOT complete the user's run with the inject's ec.
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
+    try testing.expectEqual(@as(usize, 0), s.completions().len);
+
+    // User's run's real preexec/done.
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 7, "/", 1));
+    try testing.expectEqual(@as(?i32, 7), s.completions()[0].result.exit_code);
+}
+
+test "B7: done from new pid doesn't strand a lower layer's inject_pending" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    var b: [128]u8 = undefined;
+
+    // Layer 0 hellos → inject queued, inject_pending=1.
+    try s.feedPtyOutput("\x1b]2718;hello;bash;100\x07");
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try testing.expectEqual(@as(u8, 1), s.layers.buffer[0].inject_pending);
+
+    // BEFORE layer 0's inject done arrives, a file-installed hook on a nested
+    // layer reaches its first prompt → done;555 (new pid).
+    try s.feedPtyOutput(doneOsc(&b, 555, 0, "/", 0));
+    try testing.expectEqual(@as(u8, 2), s.layers.len);
+    // Layer 0's inject_pending is still 1 (the new layer's done didn't pay it).
+    try testing.expectEqual(@as(u8, 1), s.layers.buffer[0].inject_pending);
+
+    // Layer 0's inject done finally arrives → should decrement layer 0's
+    // counter, NOT pop layer 1 (it's a known pid below top → pop). Hmm — pid
+    // 100 is below top, so popLayersAbove fires and pops layer 1. Then the
+    // done is layer 0's, inject_pending 1→0. That's correct: layer 0 reached
+    // its prompt, so anything it spawned (layer 1) has exited.
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
+    try testing.expectEqual(@as(u8, 0), s.layers.buffer[0].inject_pending);
+
+    // Now a real run at layer 0 should NOT be swallowed.
+    try s.queueRun(1, "x", false);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try s.feedPtyOutput(doneOsc(&b, TPID, 3, "/", 1));
+    try testing.expectEqual(@as(?i32, 3), s.completions()[0].result.exit_code);
+}
+
 test "stuck inject_echo_pending recovers after 5s" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
