@@ -257,6 +257,27 @@ test "posixQuote" {
     try testing.expectEqualStrings("''", q3);
 }
 
+test "hook_version constant matches __ZMYTH_HOOK_V in every asset" {
+    // The probe reports the asset's hardcoded value; if this constant is
+    // bumped without editing the assets, every probe says "stale" → install
+    // loops forever. This test makes that drift a build failure.
+    const posix = std.fmt.comptimePrint("__ZMYTH_HOOK_V={d}", .{hook_version});
+    const fish = std.fmt.comptimePrint("__ZMYTH_HOOK_V {d}", .{hook_version});
+    inline for (.{ hook_bash, hook_zsh, hook_fish }) |h| {
+        try testing.expect(std.mem.indexOf(u8, h, posix) != null or
+            std.mem.indexOf(u8, h, fish) != null);
+    }
+}
+
+test "Shell.parse round-trips every named variant" {
+    // `parse` is an if-chain (not a switch), so adding a Shell variant doesn't
+    // force updating it. This test does.
+    inline for (comptime std.meta.tags(Shell)) |sh| {
+        if (comptime sh != .unknown)
+            try testing.expectEqual(sh, Shell.parse(@tagName(sh)));
+    }
+}
+
 test "refresh_env_keys ⊆ env_forward" {
     for (refresh_env_keys) |k| {
         var found = false;

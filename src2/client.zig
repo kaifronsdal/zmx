@@ -72,15 +72,7 @@ fn connect(allocator: Allocator, name: []const u8) !posix.fd_t {
     return connectPath(sp, false);
 }
 
-fn connectOrCreate(
-    allocator: Allocator,
-    name: []const u8,
-    initial_cmd: ?[]const []const u8,
-) !posix.fd_t {
-    const r = try daemon.ensure(allocator, name, initial_cmd);
-    allocator.free(r.sock_path);
-    return r.fd;
-}
+const connectOrCreate = daemon.ensure;
 
 // ---- glob resolution -----------------------------------------------------
 

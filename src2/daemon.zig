@@ -40,31 +40,22 @@ const data_chunk = 64 * 1024;
 
 // ───────────────────────────── public API ─────────────────────────────
 
-pub const EnsureResult = struct {
-    /// Caller owns; allocated with the passed allocator.
-    sock_path: []u8,
-    /// An already-connected blocking fd to the daemon (caller owns).
-    fd: posix.fd_t,
-};
-
-/// Ensure a session daemon exists for `name`. If the socket already responds,
-/// returns the connected fd. Otherwise: fork; child becomes the daemon (setsid,
-/// redirect stdio to log, spawn shell, listen, run loop, never returns); parent
-/// waits briefly for the socket to appear and returns.
+/// Ensure a session daemon exists for `name` and return a connected blocking
+/// fd. If the socket already responds, that's it. Otherwise: fork; child
+/// becomes the daemon (setsid, redirect stdio to log, spawn shell, listen,
+/// run loop, never returns); parent waits briefly for the socket to appear.
 pub fn ensure(
     allocator: Allocator,
     name: []const u8,
     initial_cmd: ?[]const []const u8,
-) !EnsureResult {
+) !posix.fd_t {
     try paths.validateName(name);
 
     const sock_path = try paths.socketPath(allocator, name);
-    errdefer allocator.free(sock_path);
+    defer allocator.free(sock_path);
 
     // Probe: does a live daemon already own this socket?
-    if (probe(sock_path)) |fd| {
-        return .{ .sock_path = sock_path, .fd = fd };
-    }
+    if (probe(sock_path)) |fd| return fd;
 
     // Stale socket cleanup is deferred to the child (under flock) to avoid
     // racing parents unlinking a freshly-bound socket from a competing child.
@@ -86,14 +77,12 @@ pub fn ensure(
     // ── parent: wait for the socket to come up ───────────────────────
     var i: usize = 0;
     while (i < 100) : (i += 1) {
-        if (probe(sock_path)) |fd| {
-            return .{ .sock_path = sock_path, .fd = fd };
-        }
+        if (probe(sock_path)) |fd| return fd;
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
     // Daemon never came up — surface a distinct error so the caller can say
     // "daemon failed to start" rather than the misleading NoSuchSession that
-    // a follow-up connect() would produce. (errdefer above frees sock_path.)
+    // a follow-up connect() would produce.
     return error.DaemonStartTimeout;
 }
 
