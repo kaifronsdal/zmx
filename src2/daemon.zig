@@ -139,12 +139,6 @@ fn setupSignals() !posix.sigset_t {
 
 // ───────────────────────────── client ─────────────────────────────
 
-const WriteState = struct {
-    client_id: u32,
-    /// "__ZMX_EOF_" + 8 lowercase hex + "__"
-    delim: [20]u8,
-};
-
 const Client = struct {
     fd: posix.fd_t,
     /// Monotonic; Session uses this to route run completions.
@@ -186,8 +180,8 @@ const Daemon = struct {
     next_client_id: u32 = 1,
     leader_id: ?u32 = null,
 
-    /// In-flight `write` heredoc; only one at a time.
-    write_state: ?WriteState = null,
+    /// Client id of the in-flight `write` heredoc (only one at a time).
+    write_client: ?u32 = null,
 
     created_ts: i64,
     pollfds: std.ArrayList(posix.pollfd) = .empty,
@@ -681,12 +675,10 @@ fn reapClosedClients(d: *Daemon) void {
         // If this client owned an in-flight write, close the heredoc so the
         // shell returns to the prompt (body may be incomplete; base64 -d will
         // fail, but the session isn't wedged).
-        if (d.write_state) |ws| if (ws.client_id == c.id) {
-            var buf: [32]u8 = undefined;
-            const closer = std.fmt.bufPrint(&buf, "\n{s}\x1b[201~\r", .{&ws.delim}) catch unreachable;
-            d.session.queueSend(closer) catch {};
-            d.write_state = null;
-        };
+        if (d.write_client == c.id) {
+            d.session.queueSend(shell.write_closer) catch {};
+            d.write_client = null;
+        }
         c.framer.deinit();
         posix.close(c.fd);
         _ = d.clients.swapRemove(i);
@@ -748,7 +740,7 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
         .input => try handleInput(d, c, msg.payload),
         .resize => try handleResize(d, c, msg.payload),
         .run => {
-            if (d.write_state != null) {
+            if (d.write_client != null) {
                 return queueErr(c, "run: write in progress", .{});
             }
             // The locally-spawned shell is one we don't know how to hook
@@ -931,7 +923,7 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
     // ESC would let the path terminate the bracketed-paste wrapper early.
     if (std.mem.indexOfAny(u8, path, "\n\x00\x1b") != null)
         return queueErr(c, "write: path contains control character", .{});
-    if (d.write_state != null)
+    if (d.write_client != null)
         return queueErr(c, "write: another write in progress", .{});
     if (d.session.topCmdRunning() or d.session.run_queue.items.len > 0)
         return queueErr(c, "write: session busy", .{});
@@ -944,45 +936,23 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
     if (sh == .fish or sh == .unknown)
         return queueErr(c, "write: unsupported shell '{s}'", .{@tagName(sh)});
 
-    var rnd: [4]u8 = undefined;
-    std.crypto.random.bytes(&rnd);
-    var ws: WriteState = .{ .client_id = c.id, .delim = undefined };
-    @memcpy(ws.delim[0..10], "__ZMX_EOF_");
-    ws.delim[10..18].* = std.fmt.bytesToHex(rnd, .lower);
-    @memcpy(ws.delim[18..20], "__");
-
-    const quoted = try shell.posixQuote(d.gpa, path);
-    defer d.gpa.free(quoted);
-
-    // One bracketed-paste enclosing the full heredoc (opener here, body via
-    // .write_data, delimiter + paste-end on the empty .write_data).
-    const opener = try std.fmt.allocPrint(
-        d.gpa,
-        "\x15\x1b[200~base64 -d > {s} << '{s}'\n",
-        .{ quoted, &ws.delim },
-    );
+    const opener = try shell.writeOpener(d.gpa, path);
     defer d.gpa.free(opener);
     try d.session.queueSend(opener);
 
-    d.write_state = ws;
+    d.write_client = c.id;
     try c.framer.queue(.ack, "");
 }
 
 fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
-    const ws = d.write_state orelse return queueErr(c, "write: no write in progress", .{});
-    if (ws.client_id != c.id) return queueErr(c, "write: not the writing client", .{});
+    if (d.write_client != c.id) return queueErr(c, "write: no write in progress", .{});
     if (payload.len > 0) {
         try d.session.queueSend(payload);
         return;
     }
     // Empty payload = EOF: close heredoc, end paste, submit.
-    var buf: [32]u8 = undefined;
-    // Leading \n: the heredoc delimiter must be on its own line. The current
-    // client always ends each base64 chunk with \n, but a future/alternate
-    // client might not — match the reaper's closer (line ~704) for robustness.
-    const closer = std.fmt.bufPrint(&buf, "\n{s}\x1b[201~\r", .{&ws.delim}) catch unreachable;
-    try d.session.queueSend(closer);
-    d.write_state = null;
+    try d.session.queueSend(shell.write_closer);
+    d.write_client = null;
     try c.framer.queue(.ack, "");
 }
 

@@ -149,6 +149,29 @@ pub fn buildInstall(allocator: std.mem.Allocator, shell: Shell) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+// ───────────────────── `zmyth write` heredoc ─────────────────────
+//
+// One bracketed-paste enclosing a base64 heredoc: opener here, body streamed
+// chunk-by-chunk, then `write_closer`. The body is base64 so it cannot contain
+// the delimiter on its own line — no per-write random nonce needed. bash/zsh
+// only (fish has no heredoc; the streaming-without-known-length constraint
+// rules out `head -c N` here).
+
+const write_eof = "__ZMYTH_EOF__";
+pub const write_closer = "\n" ++ write_eof ++ paste_close;
+
+/// `^U \e[200~ base64 -d > 'path' << 'EOF'\n`. Caller streams base64 lines
+/// then `write_closer`. Caller frees.
+pub fn writeOpener(allocator: Allocator, path: []const u8) ![]u8 {
+    const q = try posixQuote(allocator, path);
+    defer allocator.free(q);
+    return std.fmt.allocPrint(
+        allocator,
+        paste_open ++ "base64 -d > {s} << '" ++ write_eof ++ "'\n",
+        .{q},
+    );
+}
+
 /// Wrap `s` in single quotes, encoding embedded `'` as `'\''`. Safe for
 /// bash/zsh word-splitting and expansion. Caller frees.
 pub fn posixQuote(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
