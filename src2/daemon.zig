@@ -107,34 +107,25 @@ fn sigChld(_: c_int) callconv(.c) void {
 fn setupSignals() !posix.sigset_t {
     try compat.initSignalPipe();
 
-    // Ignore SIGPIPE: client sockets going away must not kill the daemon.
-    const ign: posix.Sigaction = .{
-        .handler = .{ .handler = posix.SIG.IGN },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.PIPE, &ign, null);
-
-    const exit_act: posix.Sigaction = .{
-        .handler = .{ .handler = sigExit },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.TERM, &exit_act, null);
-    posix.sigaction(posix.SIG.INT, &exit_act, null);
-
-    const chld_act: posix.Sigaction = .{
-        .handler = .{ .handler = sigChld },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.CHLD, &chld_act, null);
+    // SIGPIPE: client sockets going away must not kill the daemon.
+    install(posix.SIG.PIPE, posix.SIG.IGN);
+    install(posix.SIG.TERM, sigExit);
+    install(posix.SIG.INT, sigExit);
+    install(posix.SIG.CHLD, sigChld);
 
     var to_block = posix.sigemptyset();
     posix.sigaddset(&to_block, posix.SIG.TERM);
     posix.sigaddset(&to_block, posix.SIG.INT);
     posix.sigaddset(&to_block, posix.SIG.CHLD);
     return compat.blockSignalsForPoll(&to_block);
+}
+
+fn install(sig: u6, handler: ?posix.Sigaction.handler_fn) void {
+    posix.sigaction(sig, &.{
+        .handler = .{ .handler = handler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    }, null);
 }
 
 // ───────────────────────────── client ─────────────────────────────
@@ -708,7 +699,6 @@ fn acceptClient(d: *Daemon) !void {
         error.WouldBlock => return,
         else => return err,
     };
-    errdefer posix.close(fd);
 
     if (!checkPeerUid(fd)) {
         log.warn("rejecting client: peer uid mismatch", .{});
@@ -720,6 +710,7 @@ fn acceptClient(d: *Daemon) !void {
         posix.close(fd);
         return;
     }
+    errdefer posix.close(fd);
 
     const id = d.next_client_id;
     d.next_client_id += 1;
@@ -869,23 +860,13 @@ fn handleRead(d: *Daemon, c: *Client, payload: []const u8) !void {
     var buf: std.Io.Writer.Allocating = .init(d.gpa);
     defer buf.deinit();
 
-    switch (mode) {
-        1 => { // screen
-            try term_state.dumpScreen(&d.session.term, &buf.writer);
-            try queueChunked(c, .data, buf.writer.buffered(), data_chunk);
-            try c.framer.queue(.eof, "");
-        },
-        2 => { // follow: scrollback then live .output
-            try term_state.dumpScrollback(d.gpa, &d.session.term, tail, &buf.writer);
-            try queueChunked(c, .data, buf.writer.buffered(), data_chunk);
-            c.wants_output = true; // receive .output going forward; no .eof
-        },
-        else => { // 0: scrollback
-            try term_state.dumpScrollback(d.gpa, &d.session.term, tail, &buf.writer);
-            try queueChunked(c, .data, buf.writer.buffered(), data_chunk);
-            try c.framer.queue(.eof, "");
-        },
-    }
+    if (mode == 1)
+        try term_state.dumpScreen(&d.session.term, &buf.writer)
+    else
+        try term_state.dumpScrollback(d.gpa, &d.session.term, tail, &buf.writer);
+    try queueChunked(c, .data, buf.writer.buffered(), data_chunk);
+    // follow: receive live .output going forward instead of an .eof.
+    if (mode == 2) c.wants_output = true else try c.framer.queue(.eof, "");
 }
 
 fn handleInfo(d: *Daemon, c: *Client) !void {

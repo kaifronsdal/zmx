@@ -466,15 +466,6 @@ test "envKeyIs" {
     try testing.expect(!envKeyIs("FOO", "FOO"));
 }
 
-test "Shell.parse round-trips every named variant" {
-    // `parse` is an if-chain (not a switch), so adding a Shell variant doesn't
-    // force updating it. This test does.
-    inline for (comptime std.meta.tags(Shell)) |sh| {
-        if (comptime sh != .unknown)
-            try testing.expectEqual(sh, Shell.parse(@tagName(sh)));
-    }
-}
-
 test "refresh_env_keys ⊆ env_forward" {
     for (refresh_env_keys) |k| {
         var found = false;

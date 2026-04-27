@@ -801,10 +801,9 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
 
         enc.clearRetainingCapacity();
         var off: usize = 0;
-        while (off < emit_end) : (off = @min(off + 48, emit_end)) {
-            const end = @min(off + 48, emit_end);
+        while (off < emit_end) : (off += 48) {
             var line: [68]u8 = undefined;
-            const e = std.base64.standard.Encoder.encode(&line, raw[off..end]);
+            const e = std.base64.standard.Encoder.encode(&line, raw[off..@min(off + 48, emit_end)]);
             try enc.appendSlice(allocator, e);
             try enc.append(allocator, '\n');
         }

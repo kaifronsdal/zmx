@@ -39,10 +39,7 @@ pub const Shell = enum {
     unknown,
 
     pub fn parse(s: []const u8) Shell {
-        if (std.mem.eql(u8, s, "bash")) return .bash;
-        if (std.mem.eql(u8, s, "zsh")) return .zsh;
-        if (std.mem.eql(u8, s, "fish")) return .fish;
-        return .unknown;
+        return std.meta.stringToEnum(Shell, s) orelse .unknown;
     }
 };
 

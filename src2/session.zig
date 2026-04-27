@@ -646,7 +646,7 @@ pub const Session = struct {
         // readiness (hooked or ?2004h). Once ready, an unsent request is
         // queued behind a running command which may legitimately take hours —
         // never fail it, just warn.
-        const ready = if (self.top()) |t| (t.hooked or self.seen_prompt) else false;
+        const ready = self.topHooked() or self.seen_prompt;
         if (!ready and waited >= 30 * std.time.ns_per_s) {
             const req = self.removeReq(r);
             const cid = req.client_id;
@@ -840,9 +840,7 @@ pub const Session = struct {
     }
 
     fn tryTypeNext(self: *Session) !void {
-        const r = self.firstUnsent() orelse return;
-        if (!self.canType()) return;
-        try self.typeCommand(r);
+        if (self.canType()) if (self.firstUnsent()) |r| try self.typeCommand(r);
     }
 
     /// Ctrl-U, bracketed-paste, cmd, end-paste, CR.
