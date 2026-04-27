@@ -141,8 +141,7 @@ pub fn build(b: *std.Build) void {
             "test/integration/nested_test.sh",
             "test/integration/headless_query.sh",
             "test/integration/hook_assets.sh",
-            // bugs.sh intentionally NOT here: it pins UNFIXED repros
-            // (B12/B13) and would fail CI. Run it manually.
+            "test/integration/bugs.sh",
         }) |script| {
             itest_step.dependOn(&integrationTest(b, &install_exe2.step, bin_path, script).step);
         }

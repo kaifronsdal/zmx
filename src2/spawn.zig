@@ -121,13 +121,16 @@ pub fn spawnShell(
             // the captured value before sourcing the user's .zshrc.
             const orig_zdot = posix.getenv("ZDOTDIR") orelse "";
             const zenv = try std.fmt.allocPrint(arena, "{s}/.zshenv", .{rc_dir});
+            // rc_dir derives from user-supplied $ZMYTH_DIR; quote it so a
+            // `'` in the path can't break out of the assignment.
+            const rc_dir_q = try @import("shell.zig").posixQuote(arena, rc_dir);
             const zenv_body = try std.fmt.allocPrint(
                 arena,
                 "if [ -n \"$_ZMYTH_ORIG_ZDOTDIR\" ]; then export ZDOTDIR=\"$_ZMYTH_ORIG_ZDOTDIR\"; else unset ZDOTDIR; fi\n" ++
                     "[ -f \"${{ZDOTDIR:-$HOME}}/.zshenv\" ] && . \"${{ZDOTDIR:-$HOME}}/.zshenv\"\n" ++
                     "export _ZMYTH_USER_ZDOTDIR=\"${{ZDOTDIR-__unset__}}\"\n" ++
-                    "export ZDOTDIR='{s}'\n",
-                .{rc_dir},
+                    "export ZDOTDIR={s}\n",
+                .{rc_dir_q},
             );
             try writeFile(zenv, zenv_body);
             const rc = try std.fmt.allocPrint(arena, "{s}/.zshrc", .{rc_dir});

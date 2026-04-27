@@ -25,8 +25,6 @@ const assert = std.debug.assert;
 // cheap to skip: find terminator, drop. This keeps the boundary-safe scan
 // logic uniform across 2718/7/133 instead of one indexOf per number.
 const OSC_START = "\x1b]";
-const BEL = "\x07";
-const ST = "\x1b\\";
 const BP_ON = "\x1b[?2004h";
 
 /// Longest possible partial prefix of any marker we scan for. Used to bound
@@ -129,34 +127,36 @@ pub const Scanner = struct {
                 },
                 .osc => {
                     const tail = b[best + OSC_START.len ..];
-                    const t_bel = std.mem.indexOf(u8, tail, BEL);
-                    const t_st = std.mem.indexOf(u8, tail, ST);
-                    const t_csi = std.mem.indexOf(u8, tail, "\x1b[");
+                    // OSC ends at the first BEL, or at the first ESC — which
+                    // is either the ST terminator `\e\` or an *abort* (any
+                    // other ESC: a new OSC, CSI, etc.). Real VT parsers abort
+                    // an OSC on any C0 control; we match that for ESC so a
+                    // malformed/unterminated OSC immediately preceding one of
+                    // ours (e.g. user's PROMPT_COMMAND forgot the `\a`) can't
+                    // swallow our event.
+                    const t_bel = std.mem.indexOfScalar(u8, tail, 0x07);
+                    const t_esc = std.mem.indexOfScalar(u8, tail, 0x1b);
                     const term: struct { off: usize, len: usize } = blk: {
-                        // A CSI introducer inside the payload means the OSC
-                        // was never terminated. Real VT parsers abort the OSC
-                        // on ESC-then-[ and dispatch the CSI; do the same so
-                        // a malformed hook emission can't trap a following
-                        // ?2004h and suppress .prompt forever.
-                        if (t_csi) |tc| {
-                            const before_bel = if (t_bel) |tb| tc < tb else true;
-                            const before_st = if (t_st) |ts| tc < ts else true;
-                            if (before_bel and before_st) {
-                                self.consume(best + OSC_START.len + tc);
-                                continue;
+                        const bel = t_bel orelse std.math.maxInt(usize);
+                        if (t_esc) |e| if (e < bel) {
+                            // ESC before any BEL. ST, abort, or incomplete?
+                            if (e + 1 >= tail.len) {
+                                // ESC is the last byte; the next byte (which
+                                // decides ST vs abort) hasn't arrived. Wait.
+                                if (tail.len > MAX_OSC_PAYLOAD) {
+                                    self.consume(best + OSC_START.len);
+                                    continue;
+                                }
+                                self.consume(best);
+                                return;
                             }
-                        }
-                        if (t_bel) |tb| {
-                            if (t_st) |ts| {
-                                break :blk if (tb < ts) .{ .off = tb, .len = 1 } else .{ .off = ts, .len = 2 };
-                            }
-                            break :blk .{ .off = tb, .len = 1 };
-                        }
-                        if (t_st) |ts| break :blk .{ .off = ts, .len = 2 };
-                        // Incomplete OSC. Keep from the OSC start onward and
-                        // wait for more data — unless the payload has grown
-                        // implausibly large, in which case skip the start
-                        // bytes so we don't wedge.
+                            if (tail[e + 1] == '\\') break :blk .{ .off = e, .len = 2 };
+                            // Abort: discard this OSC, re-scan from the ESC.
+                            self.consume(best + OSC_START.len + e);
+                            continue;
+                        };
+                        if (t_bel) |p| break :blk .{ .off = p, .len = 1 };
+                        // No terminator yet.
                         if (tail.len > MAX_OSC_PAYLOAD) {
                             self.consume(best + OSC_START.len);
                             continue;
@@ -164,8 +164,7 @@ pub const Scanner = struct {
                         self.consume(best);
                         return;
                     };
-                    const payload = tail[0..term.off];
-                    self.parsePayload(payload, out) catch {};
+                    self.parsePayload(tail[0..term.off], out) catch {};
                     self.consume(best + OSC_START.len + term.off + term.len);
                 },
             }
@@ -482,16 +481,17 @@ test "B1: unterminated OSC immediately followed by OSC 2718 — inner not lost" 
     try testing.expectEqual(@as(i32, 42), ev.preexec);
 }
 
-test "B2: CSI inside a *terminated* OSC payload not mistaken for abort" {
-    // OSC 0 title containing literal `\e[?2004h` text — the OSC is properly
-    // BEL-terminated, so the CSI-abort heuristic must not fire and emit a
-    // spurious .prompt.
+test "ESC inside OSC payload aborts (matches real VT parsers)" {
+    // Per ECMA-48, any C0 control inside an OSC string aborts it. So
+    // `\e]0;text\e[?2004h...\a` is: aborted OSC, then a real CSI ?2004h,
+    // then literal `...`, then a bell. The .prompt event IS correct.
     var s = Scanner.init(testing.allocator);
     defer s.deinit();
     var evs: std.ArrayList(Event) = .empty;
     defer evs.deinit(testing.allocator);
     try s.feed("\x1b]0;title-with-\x1b[?2004h-in-it\x07", &evs);
-    try testing.expectEqual(@as(usize, 0), evs.items.len);
+    try testing.expectEqual(@as(usize, 1), evs.items.len);
+    try testing.expect(evs.items[0] == .prompt);
 }
 
 test "OSC 7 (pwd) parsed" {

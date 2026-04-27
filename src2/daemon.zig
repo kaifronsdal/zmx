@@ -953,8 +953,9 @@ fn handleInfo(d: *Daemon, c: *Client) !void {
 fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
     if (path.len == 0 or path.len >= 4096)
         return queueErr(c, "write: invalid path length", .{});
-    if (std.mem.indexOfAny(u8, path, "\n\x00") != null)
-        return queueErr(c, "write: path contains newline/NUL", .{});
+    // ESC would let the path terminate the bracketed-paste wrapper early.
+    if (std.mem.indexOfAny(u8, path, "\n\x00\x1b") != null)
+        return queueErr(c, "write: path contains control character", .{});
     if (d.write_state != null)
         return queueErr(c, "write: another write in progress", .{});
     if (d.session.topCmdRunning() or d.session.run_queue.items.len > 0)

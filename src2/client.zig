@@ -266,11 +266,12 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
 
     // Refuse to nest regardless of which session we're inside: attaching to
     // ourselves recurses, and attaching to another session leaves the outer
-    // attach's raw-mode/alt-screen wrapping in a confused state.
-    if (posix.getenv("ZMYTH_SESSION")) |cur| {
+    // attach's raw-mode/alt-screen wrapping in a confused state. Set-but-
+    // empty (`ZMYTH_SESSION=`) is the explicit override.
+    if (posix.getenv("ZMYTH_SESSION")) |cur| if (cur.len > 0) {
         errf("zmyth: already inside session '{s}'; detach first or use `send`\n", .{cur});
         return 1;
-    }
+    };
 
     const sock = connectOrCreate(allocator, name, initial_cmd) catch |err| {
         errf("zmyth: attach: {s}\n", .{@errorName(err)});
@@ -598,13 +599,16 @@ pub fn read(allocator: Allocator, args: []const [:0]const u8) !u8 {
 
     while (true) {
         const msg = ipc.recvBlocking(allocator, sock) catch |err| switch (err) {
-            error.UnexpectedEof => return 0,
+            // A clean end arrives as an `.eof` frame; raw socket EOF without
+            // one means the daemon died (or, in non-follow mode, the dump
+            // completed and the daemon hung up — also fine).
+            error.UnexpectedEof => return if (follow) 1 else 0,
             else => return err,
         };
         defer allocator.free(msg.payload);
         switch (msg.tag) {
             .data, .output => try writeAllFd(posix.STDOUT_FILENO, msg.payload),
-            .eof => if (!follow) return 0,
+            .eof => return 0,
             .err => {
                 errf("zmyth: read: {s}\n", .{msg.payload});
                 return 1;
