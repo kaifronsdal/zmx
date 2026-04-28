@@ -22,12 +22,15 @@ const Session = @import("session.zig").Session;
 
 const log = std.log.scoped(.daemon);
 
-/// Drop a client whose outbound framer backlog exceeds this.
-const client_backpressure_limit = 4 * 1024 * 1024;
-/// A leader whose backlog crosses this is demoted (kept connected). A client
-/// that isn't draining is one whose terminal is catatonic (half-open SSH,
-/// stuck pty master) — it must not keep driving the PTY's winsize.
-const leader_demote_backlog = 256 * 1024;
+/// A client is *stalled* if it has more than this queued AND hasn't drained
+/// anything in `stall_window`. Backlog size alone is the wrong signal — a
+/// fresh attach has MBs of `.state` queued but is draining at line rate; a
+/// hung SSH may have only 50KB but is draining at 0. Stalled clients are
+/// demoted from leader and don't count as a real terminal for headless DSR.
+const stall_min_backlog = 64 * 1024;
+const stall_window = 2 * std.time.ns_per_s;
+/// Hard cap: drop a stalled client whose backlog exceeds this (OOM guard).
+const client_drop_backlog = 16 * 1024 * 1024;
 /// Refuse new connections beyond this; protects against fd exhaustion from
 /// idle/leaked clients (each connection is same-uid, so this is anti-foot-gun
 /// not a security boundary).
@@ -168,6 +171,17 @@ const Client = struct {
     /// Last reported terminal size from this client (for leader promotion).
     rows: u16 = 24,
     cols: u16 = 80,
+    /// nanoTimestamp of the last successful socket write (or accept time for
+    /// a fresh client). Drives `stalled()`.
+    last_drain_ns: i128,
+
+    /// True iff this client has a non-trivial backlog that hasn't moved in
+    /// `stall_window`. A large-but-draining backlog (attach replay) is fine;
+    /// a small-but-frozen one (hung SSH) is not.
+    fn stalled(c: *const Client, now: i128) bool {
+        return c.framer.pendingWrite().len > stall_min_backlog and
+            now - c.last_drain_ns > stall_window;
+    }
 };
 
 // ───────────────────────────── daemon state ─────────────────────────────
@@ -395,14 +409,15 @@ fn runLoop(d: *Daemon) !void {
         };
 
         if (should_exit.load(.acquire)) break;
+        const now = std.time.nanoTimestamp();
 
         // ── listen_fd ────────────────────────────────────────────────
         if (d.pollfds.items[idx_listen].revents & posix.POLL.IN != 0) {
-            acceptClient(d) catch |err| log.warn("accept: {s}", .{@errorName(err)});
+            acceptClient(d, now) catch |err| log.warn("accept: {s}", .{@errorName(err)});
         }
 
         // ── pty_fd ───────────────────────────────────────────────────
-        if (try servicePty(d, d.pollfds.items[idx_pty].revents, &read_buf)) break;
+        if (try servicePty(d, d.pollfds.items[idx_pty].revents, &read_buf, now)) break;
 
         // ── client fds ───────────────────────────────────────────────
         // Only iterate clients that existed when pollfds was built.
@@ -411,10 +426,9 @@ fn runLoop(d: *Daemon) !void {
         while (i < polled) : (i += 1) {
             const c = &d.clients.items[i];
             if (c.closed) continue;
-            serviceClient(d, c, d.pollfds.items[fixed_fds + i].revents, &read_buf);
+            serviceClient(d, c, d.pollfds.items[fixed_fds + i].revents, &read_buf, now);
         }
 
-        const now = std.time.nanoTimestamp();
         // Acceptance-timeout check (front run typed but no preexec yet).
         if (d.session.checkAcceptanceTimeout(now)) {
             routeCompletions(d);
@@ -447,7 +461,7 @@ fn runLoop(d: *Daemon) !void {
         }
 
         reapChildren(d);
-        reapClosedClients(d);
+        reapClosedClients(d, now);
     }
 }
 
@@ -464,7 +478,7 @@ fn readNb(fd: posix.fd_t, buf: []u8) ?usize {
 
 /// Drain queued PTY input (POLLOUT), then read PTY output (POLLIN/HUP) and
 /// broadcast it. Returns true on PTY EOF — caller breaks the poll loop.
-fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
+fn servicePty(d: *Daemon, re: i16, read_buf: []u8, now: i128) !bool {
     if (re & posix.POLL.OUT != 0) {
         const pending = d.session.pendingPtyInput();
         if (pending.len > 0) {
@@ -487,47 +501,45 @@ fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
         return true;
     }
     const data = read_buf[0..n];
-    // Recount before each feed: a client whose backlog has crossed the demote
-    // threshold (catatonic terminal) won't relay query replies, so it doesn't
-    // count as "someone who'll answer."
+    // Recount before each feed: a stalled client's terminal won't relay
+    // query replies, so it doesn't count as "someone who'll answer."
     d.session.attached_clients = blk: {
         var k: u32 = 0;
-        for (d.clients.items) |*c| if (c.attached and !c.closed and
-            c.framer.pendingWrite().len <= leader_demote_backlog)
-        {
-            k += 1;
-        };
+        for (d.clients.items) |*c| {
+            if (c.attached and !c.closed and !c.stalled(now)) k += 1;
+        }
         break :blk k;
     };
-    try d.session.feedPtyOutput(data);
+    d.session.feedPtyOutput(data) catch |e| {
+        // ghostty alloc failure: drop this chunk, keep the daemon alive.
+        log.warn("feedPtyOutput: {s}; dropping {d}B", .{ @errorName(e), data.len });
+    };
     releaseWriteAck(d);
     // Broadcast to clients that want live output.
     for (d.clients.items) |*c| {
-        if (c.wants_output and !c.closed) {
-            const backlog = c.framer.pendingWrite().len;
-            if (backlog > client_backpressure_limit) {
-                log.warn("client {d} write backlog >4MiB; dropping", .{c.id});
+        if (!c.wants_output or c.closed) continue;
+        if (c.stalled(now)) {
+            if (c.framer.pendingWrite().len > client_drop_backlog) {
+                log.warn("client {d} stalled with >{d}MiB backlog; dropping", .{ c.id, client_drop_backlog >> 20 });
+                queueOrClose(c, .err, "output backlog exceeded; detaching");
                 c.closed = true;
                 continue;
             }
-            if (d.leader_id == c.id and backlog > leader_demote_backlog) {
-                log.warn(
-                    "client {d} backlog >{d}KiB; demoting leader",
-                    .{ c.id, leader_demote_backlog / 1024 },
-                );
+            if (d.leader_id == c.id) {
+                log.warn("client {d} stalled; demoting leader", .{c.id});
                 d.leader_id = null; // reapClosedClients re-elects
             }
-            queueOrClose(c, .output, data);
         }
+        queueOrClose(c, .output, data);
     }
     routeCompletions(d);
     return false;
 }
 
 /// POLLOUT flush, POLLIN read+dispatch, HUP/ERR close.
-fn serviceClient(d: *Daemon, c: *Client, re: i16, read_buf: []u8) void {
+fn serviceClient(d: *Daemon, c: *Client, re: i16, read_buf: []u8, now: i128) void {
     if (re & posix.POLL.OUT != 0) {
-        flushClient(c);
+        flushClient(c, now);
     }
     if (re & posix.POLL.IN != 0) {
         if (readNb(c.fd, read_buf)) |n| {
@@ -573,7 +585,7 @@ fn reapChildren(d: *Daemon) void {
     }
 }
 
-fn flushClient(c: *Client) void {
+fn flushClient(c: *Client, now: i128) void {
     const pending = c.framer.pendingWrite();
     if (pending.len == 0) return;
     const n = posix.write(c.fd, pending) catch |err| switch (err) {
@@ -583,6 +595,7 @@ fn flushClient(c: *Client) void {
             return;
         },
     };
+    if (n > 0) c.last_drain_ns = now;
     c.framer.consumeWrite(n);
 }
 
@@ -613,7 +626,7 @@ fn handlePtyEof(d: *Daemon) void {
     for (d.clients.items) |*c| {
         if (!c.closed) {
             c.framer.queue(.eof, "") catch {};
-            flushClient(c);
+            flushClient(c, 0);
         }
     }
 }
@@ -674,7 +687,7 @@ fn drainWaiters(d: *Daemon) void {
     };
 }
 
-fn reapClosedClients(d: *Daemon) void {
+fn reapClosedClients(d: *Daemon, now: i128) void {
     var i: usize = 0;
     while (i < d.clients.items.len) {
         const c = &d.clients.items[i];
@@ -683,7 +696,7 @@ fn reapClosedClients(d: *Daemon) void {
             continue;
         }
         // Best-effort flush of any final ack/err before close.
-        flushClient(c);
+        flushClient(c, now);
         log.info("client {d} disconnected", .{c.id});
         if (d.leader_id == c.id) d.leader_id = null;
         // Don't execute commands queued by a now-dead client.
@@ -702,21 +715,19 @@ fn reapClosedClients(d: *Daemon) void {
         _ = d.clients.swapRemove(i);
     }
     // Promote a new leader if the old one was reaped or demoted. Only a
-    // client that's actually draining is eligible — re-electing a backlog-
-    // demoted client would demote→re-elect→resize+SIGWINCH every poll tick.
-    // With no eligible client, leave leader_id null: the PTY stays at its
-    // last size until a healthy client appears or types (handleInput).
+    // non-stalled client is eligible — re-electing a stalled one would
+    // demote→re-elect→resize+SIGWINCH every poll tick. With no eligible
+    // client, leave leader_id null: the PTY stays at its last size until a
+    // healthy client appears or types (handleInput).
     if (d.leader_id == null) {
-        for (d.clients.items) |*nc| if (nc.attached and !nc.closed and
-            nc.framer.pendingWrite().len <= leader_demote_backlog)
-        {
+        for (d.clients.items) |*nc| if (nc.attached and !nc.closed and !nc.stalled(now)) {
             d.promoteLeader(nc);
             break;
         };
     }
 }
 
-fn acceptClient(d: *Daemon) !void {
+fn acceptClient(d: *Daemon, now: i128) !void {
     const fd = posix.accept(
         d.listen_fd,
         null,
@@ -746,6 +757,7 @@ fn acceptClient(d: *Daemon) !void {
         .id = id,
         .framer = ipc.Framer.init(d.gpa),
         .input_cls = input.Classifier.init(),
+        .last_drain_ns = now,
     });
     log.info("client {d} connected (total={d})", .{ id, d.clients.items.len });
 }
@@ -864,6 +876,9 @@ fn handleInput(d: *Daemon, c: *Client, payload: []const u8) !void {
         c.closed = true;
         return;
     }
+    // While a PTY-mode write is streaming the body, anything typed would be
+    // interleaved into `head -c N`'s input and corrupt the file. Drop it.
+    if (d.write) |w| if (w.begun) return;
     // Leader promotion on real user keystrokes (#135 fix: never drop, just
     // don't promote on terminal-generated reports).
     if (r.user_input and d.leader_id != c.id) d.promoteLeader(c);

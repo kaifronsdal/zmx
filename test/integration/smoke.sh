@@ -142,6 +142,22 @@ chk "10  read -s contains SCREEN-MARKER" "[ $? -eq 0 ]"
 nuke t10
 
 # ─────────────────────────────────────────────────────────────────────────────
+# T1. scrollback retention (ghostty default is 10KB *bytes*; we set 10MB)
+# ─────────────────────────────────────────────────────────────────────────────
+"$ZMX" run tT1 -- 'seq 1 5000' >/dev/null
+n=$("$ZMX" read tT1 2>/dev/null | grep -cE '^[0-9]+$')
+chk "T1  scrollback holds 5000 lines (got $n)" "[ $n -ge 4990 ]"
+nuke tT1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T2. wait/kill on a glob matching nothing → ec=1 (not silent 0)
+# ─────────────────────────────────────────────────────────────────────────────
+"$ZMX" wait 'no-such-prefix-*' 2>/dev/null
+chk "T2a wait '<no-match-glob>' -> ec=1" "[ $? -eq 1 ]"
+"$ZMX" kill 'no-such-prefix-*' 2>/dev/null
+chk "T2b kill '<no-match-glob>' -> ec=1" "[ $? -eq 1 ]"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 12. glob kill
 # ─────────────────────────────────────────────────────────────────────────────
 "$ZMX" run g-a -- true >/dev/null

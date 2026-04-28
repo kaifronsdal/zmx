@@ -230,6 +230,10 @@ pub const Session = struct {
         var term = try vt.Terminal.init(allocator, .{
             .cols = @max(1, cols),
             .rows = @max(1, rows),
+            // ghostty's default is 10_000 *bytes* (~125 lines). 10 MB ≈
+            // 100K 80-col lines — enough to make `read`/attach useful
+            // without unbounded growth under `cat hugefile`.
+            .max_scrollback = 10 * 1024 * 1024,
         });
         errdefer term.deinit(allocator);
 
@@ -650,9 +654,14 @@ pub const Session = struct {
         // floored at ACCEPT_TIMEOUT_NS. First command after hooking uses the
         // floor (latency is 0); subsequent ones scale to the link.
         const window = @max(ACCEPT_TIMEOUT_NS, 3 * self.last_preexec_latency_ns);
-        if (now_ns - r.flushed_ns < window) return false;
+        const waited = now_ns - r.flushed_ns;
+        if (waited < window) return false;
 
         // Shell is at a continuation prompt (unclosed quote, etc.). Abort.
+        // Widen the latency estimate from how long we waited so the *next*
+        // attempt's window grows — otherwise a slow link whose first preexec
+        // never arrives would reject every command at the 1s floor forever.
+        self.last_preexec_latency_ns = @max(self.last_preexec_latency_ns, waited);
         self.pty_input.append(self.gpa, 0x03) catch {};
         const req = self.removeReq(r);
         self.complete(req, .{
@@ -1301,6 +1310,32 @@ test "?2004h-then-done split across reads: request typed in gap is upgraded" {
     // No preexec arrives (continuation prompt) → acceptance timeout ^C's it.
     try testing.expect(s.checkAcceptanceTimeout(std.math.maxInt(i64)));
     try testing.expectEqual(.line_rejected, s.completions()[0].result.via);
+}
+
+test "T5: rejection widens the acceptance window for the next attempt" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    // First command on a slow link: no preexec arrives, rejected at the
+    // 1s floor.
+    try s.queueRun(1, "a", false);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    const tf = s.run_queue.items[0].flushed_ns;
+    try testing.expect(s.checkAcceptanceTimeout(tf + ACCEPT_TIMEOUT_NS + 50 * std.time.ns_per_ms));
+    try testing.expectEqual(.line_rejected, s.completions()[0].result.via);
+    s.clearCompletions();
+    s.consumePtyInput(s.pendingPtyInput().len); // ^C
+
+    // Latency estimate widened from the wait → next window is ~3× that.
+    try testing.expect(s.last_preexec_latency_ns >= ACCEPT_TIMEOUT_NS);
+    var b: [128]u8 = undefined;
+    try s.feedPtyOutput(doneOsc(&b, TPID, 130, "/", 0)); // ^C's precmd
+    try s.queueRun(2, "b", false);
+    s.consumePtyInput(s.pendingPtyInput().len);
+    const tf2 = s.run_queue.items[0].flushed_ns;
+    // Past the old 1s floor: must NOT reject (window has grown).
+    try testing.expect(!s.checkAcceptanceTimeout(tf2 + ACCEPT_TIMEOUT_NS + 50 * std.time.ns_per_ms));
 }
 
 test "acceptance timeout adapts to observed preexec latency" {

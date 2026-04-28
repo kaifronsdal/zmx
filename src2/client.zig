@@ -86,6 +86,10 @@ fn hasGlobChars(s: []const u8) bool {
 
 /// Expand each pattern against listSessions(); literals that match nothing
 /// are passed through so the verb can report "no such session".
+/// Expand `patterns` against live sessions. Unmatched literals pass through
+/// (so `wait foo` errors at connect time with a useful message); unmatched
+/// globs are dropped. The caller is expected to treat an empty result as an
+/// error when patterns were given — `wait 'typo-*' && deploy` must not fire.
 fn resolveGlobs(allocator: Allocator, patterns: []const []const u8) ![][]const u8 {
     const sessions = try paths.listSessions(allocator);
     defer {
@@ -744,6 +748,10 @@ pub fn wait(allocator: Allocator, args: []const [:0]const u8) !u8 {
         for (names) |n| allocator.free(n);
         allocator.free(names);
     }
+    if (names.len == 0) {
+        errf("zmyth: wait: no sessions match\n", .{});
+        return 1;
+    }
 
     var agg: u8 = 0;
     for (names) |name| {
@@ -964,6 +972,10 @@ pub fn kill(allocator: Allocator, args: []const [:0]const u8) !u8 {
     defer {
         for (names) |n| allocator.free(n);
         allocator.free(names);
+    }
+    if (names.len == 0) {
+        errf("zmyth: kill: no sessions match\n", .{});
+        return 1;
     }
 
     var rc: u8 = 0;

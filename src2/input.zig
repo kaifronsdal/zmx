@@ -22,9 +22,14 @@ pub const Classifier = struct {
     parser: vt.Parser,
     /// Bytes to swallow following a legacy mouse report (CSI M + 3 bytes).
     skip_bytes: u8,
+    /// Inside a bracketed-paste (`\e[200~`…`\e[201~`). The detach key is
+    /// suppressed here so a clipboard containing 0x1c (binary garbage,
+    /// terminal recordings) doesn't detach the session. The outer terminal
+    /// only emits these when it has paste enabled, so we can trust them.
+    in_paste: bool,
 
     pub fn init() Classifier {
-        return .{ .parser = .init(), .skip_bytes = 0 };
+        return .{ .parser = .init(), .skip_bytes = 0, .in_paste = false };
     }
 
     pub fn feed(self: *Classifier, bytes: []const u8) Result {
@@ -49,7 +54,7 @@ pub const Classifier = struct {
                     .print => r.user_input = true,
                     .execute => |code| {
                         r.user_input = true;
-                        if (code == 0x1c) r.detach = true;
+                        if (code == 0x1c and !self.in_paste) r.detach = true;
                     },
                     .csi_dispatch => |csi| self.classifyCsi(csi, &r),
                     // Alt+key, vi-mode ESC-then-key, SS3 fn keys all surface
@@ -93,9 +98,19 @@ pub const Classifier = struct {
             // caught by the '?' check above; the ANSI-mode form lands here.
             'y' => if (has(csi.intermediates, '$')) return,
             // Bracketed-paste markers themselves are not input; the wrapped
-            // content arrives as ordinary .print/.execute and is counted.
-            '~' => if (csi.params.len >= 1 and
-                (csi.params[0] == 200 or csi.params[0] == 201)) return,
+            // content arrives as ordinary .print/.execute and is counted
+            // (but not as detach — see `in_paste`).
+            '~' => if (csi.params.len >= 1) switch (csi.params[0]) {
+                200 => {
+                    self.in_paste = true;
+                    return;
+                },
+                201 => {
+                    self.in_paste = false;
+                    return;
+                },
+                else => {},
+            },
             else => {},
         }
 
@@ -199,6 +214,17 @@ test "bracketed paste markers are not user input but content is" {
     try expectOne("\x1b[200~", false, false);
     try expectOne("\x1b[201~", false, false);
     try expectOne("\x1b[200~hi\x1b[201~", false, true);
+}
+
+test "T4: 0x1c inside bracketed paste does NOT detach" {
+    try expectOne("\x1b[200~before\x1cafter\x1b[201~", false, true);
+    // Split across feeds: paste-open in one, 0x1c in the next.
+    var c = Classifier.init();
+    try expectFeed(&c, "\x1b[200~", false, false);
+    try expectFeed(&c, "\x1c", false, true);
+    try expectFeed(&c, "\x1b[201~", false, false);
+    // After paste closes, 0x1c detaches again.
+    try expectFeed(&c, "\x1c", true, true);
 }
 
 test "arrow key is user input" {
