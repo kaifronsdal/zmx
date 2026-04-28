@@ -44,7 +44,7 @@ const hook_zsh = @embedFile("assets/hook.zsh");
 const hook_fish = @embedFile("assets/hook.fish");
 
 /// Bumped whenever a hook asset changes in a way that requires reinstall.
-pub const hook_version: u32 = 1;
+pub const hook_version: u32 = 2;
 
 /// Where `zmyth hook` writes the per-shell hook file. Referenced by
 /// `buildInstall`, the `hook` verb's no-arg help text, and the daemon's
@@ -185,14 +185,17 @@ pub fn writeOpener(allocator: Allocator, path: []const u8, n: u64, gzip: bool) !
     );
 }
 
-/// Quote `path` for use as a redirect target. `~/…` keeps the tilde
-/// unquoted so the shell expands it (tilde expansion happens before quote
-/// removal, so `~/'rest'` → `$HOME/rest`); everything else is posixQuote'd.
+/// Quote `path` for use as a redirect target. A leading `~`/`~user/` prefix
+/// is left unquoted so the shell expands it — tilde expansion needs the `~`
+/// and the terminating `/` both unquoted, then `'rest'` is concatenated
+/// after quote removal (so `~user/'rest'` → `<user's home>/rest`).
+/// Everything else is posixQuote'd.
 fn quoteRedirectTarget(allocator: Allocator, path: []const u8) ![]u8 {
-    if (std.mem.startsWith(u8, path, "~/")) {
-        const q = try posixQuote(allocator, path[2..]);
+    if (path.len > 0 and path[0] == '~') {
+        const cut = if (std.mem.indexOfScalar(u8, path, '/')) |s| s + 1 else path.len;
+        const q = try posixQuote(allocator, path[cut..]);
         defer allocator.free(q);
-        return std.fmt.allocPrint(allocator, "~/{s}", .{q});
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ path[0..cut], q });
     }
     return posixQuote(allocator, path);
 }
@@ -466,6 +469,23 @@ test "embedded hooks: comment-free, no ESC, end with newline" {
         while (std.mem.indexOfScalarPos(u8, h, i, '#')) |p| : (i = p + 1) {
             try testing.expect(p > 0 and h[p - 1] != ' ' and h[p - 1] != '\n');
         }
+    }
+}
+
+test "quoteRedirectTarget: tilde prefix unquoted through the slash" {
+    const cases = .{
+        .{ "/abs/path", "'/abs/path'" },
+        .{ "~/foo", "~/'foo'" },
+        .{ "~/foo's bar", "~/'foo'\\''s bar'" },
+        .{ "~user/x", "~user/'x'" },
+        .{ "~", "~''" },
+        .{ "~root", "~root''" },
+        .{ "rel", "'rel'" },
+    };
+    inline for (cases) |c| {
+        const q = try quoteRedirectTarget(testing.allocator, c[0]);
+        defer testing.allocator.free(q);
+        try testing.expectEqualStrings(c[1], q);
     }
 }
 

@@ -1,6 +1,6 @@
 if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
-  typeset -g __ZMYTH_HOOK_V=1
-  typeset -g __ZMX_CAP=z$(command -v gunzip >/dev/null 2>&1 && printf g)
+  typeset -g __ZMYTH_HOOK_V=2
+  typeset -g __ZMX_CAP=z; command -v gunzip >/dev/null 2>&1 && __ZMX_CAP=zg
   zmodload zsh/datetime 2>/dev/null
   typeset -g __ZMX_RAN=0
   typeset -g __ZMX_T0=

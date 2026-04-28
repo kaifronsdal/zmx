@@ -18,6 +18,18 @@ out=$(bash --norc -ec '
 ' 2>&1)
 chk "B9: hook.bash precmd survives set -e" 'echo "$out" | grep -q SURVIVED' '$out'
 
+echo "── H4: hook.bash cap probe under set -e WITHOUT gunzip ──"
+nogz=$(mktemp -d); ln -sf "$(command -v sed)" "$nogz/sed"
+out=$(bash --norc -c '
+  set -e
+  PATH='"$nogz"'   # sed for the DEBUG-trap parse; no gunzip
+  PROMPT_COMMAND=""
+  source '"$ASSETS"'/hook.bash
+  echo "SURVIVED $__ZMX_CAP"
+' 2>&1)
+rm -rf "$nogz"
+chk "H4: cap probe survives set -e w/o gunzip" 'echo "$out" | grep -q "SURVIVED b$"' '$out'
+
 echo "── hook.bash under comma-decimal locale (B8) ──"
 # Find an installed locale with comma decimal_point.
 comma_loc=$(locale -a 2>/dev/null | grep -iE '^(de_DE|fr_FR|nl_NL|es_ES|ru_RU)' | head -1)

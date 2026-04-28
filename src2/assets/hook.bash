@@ -1,6 +1,6 @@
 if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" && "${BASH_VERSINFO[0]:-0}" -ge 4 ]]; then
-  __ZMYTH_HOOK_V=1
-  __ZMX_CAP=b$(command -v gunzip >/dev/null 2>&1 && printf g)
+  __ZMYTH_HOOK_V=2
+  __ZMX_CAP=b; command -v gunzip >/dev/null 2>&1 && __ZMX_CAP=bg
   __ZMX_T0=
   __ZMX_AT_PROMPT=
   __ZMX_IN_PC=

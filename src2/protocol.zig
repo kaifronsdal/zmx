@@ -236,7 +236,10 @@ pub const Scanner = struct {
                     'f' => .fish,
                     else => .unknown,
                 } else .unknown,
-                .has_gunzip = std.mem.indexOfScalar(u8, sh_s[@min(1, sh_s.len)..], 'g') != null,
+                // Pre-v2 hooks emit 4 fields (no cap), so `sh_s` is the cwd.
+                // Don't let a 'g' in the path read as gunzip.
+                .has_gunzip = sh_s.len >= 2 and sh_s.len <= 4 and
+                    std.mem.indexOfScalar(u8, sh_s[1..], 'g') != null,
             } });
         } else if (std.mem.eql(u8, kind, "probe")) {
             try out.append(self.gpa, .{ .probe = parseProbe(it.rest()) });
@@ -331,6 +334,16 @@ test "done ST-terminated" {
     const ev2 = (try collectOne(&s, "\x1b]2718;done;1;0;0;f;/\x07")).?;
     try testing.expectEqual(Shell.fish, ev2.done.shell);
     try testing.expect(!ev2.done.has_gunzip);
+}
+
+test "H5: pre-v2 4-field done — cwd-as-cap doesn't read as gunzip" {
+    var s = Scanner.init(testing.allocator);
+    defer s.deinit();
+    // A v1 file-installed hook emits no cap field; the parser sees the cwd
+    // where cap should be. A 'g' in the path must not flip has_gunzip.
+    const ev = (try collectOne(&s, "\x1b]2718;done;42;0;7;/home/greg\x07")).?;
+    try testing.expectEqual(Shell.unknown, ev.done.shell);
+    try testing.expect(!ev.done.has_gunzip);
 }
 
 test "preexec" {

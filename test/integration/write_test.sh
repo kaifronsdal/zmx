@@ -149,6 +149,45 @@ nuke wt-nogz
 # ─────────────────────────────────────────────────────────────────────────────
 # Abort: client killed mid-write → daemon ^C's, session returns to prompt.
 # ─────────────────────────────────────────────────────────────────────────────
+echo "── H2: single-quote in path → trace marker doesn't wedge session ──"
+sqdst="/tmp/zmyth it's $$"; rm -f "$sqdst"
+"$ZMX" run wt-sq -- true >/dev/null 2>&1
+printf x | timeout 5 "$ZMX" write wt-sq "$sqdst"
+chk "sq-path: file written" "[ \"\$(cat \"$sqdst\" 2>/dev/null)\" = x ]"
+out=$(timeout 5 "$ZMX" run -j wt-sq -- 'echo OK' 2>/dev/null | tail -1)
+chk "sq-path: session not wedged after trace" \
+    "[ \"\$(echo '$out' | jq -r .exit_code 2>/dev/null)\" = 0 ]"
+rm -f "$sqdst"; nuke wt-sq
+
+echo "── H3: 0-byte PTY write doesn't hang on preexec+done same-chunk race ──"
+ZMYTH_WRITE_FORCE_PTY=1 "$ZMX" run wt-z0 -- true >/dev/null 2>&1
+ok=1
+for i in $(seq 50); do
+  timeout 5 "$ZMX" write wt-z0 '~/.zmyth-z0' </dev/null 2>/dev/null || { ok=0; break; }
+  "$ZMX" run wt-z0 -- true >/dev/null 2>&1
+done
+chk "0-byte PTY write never hangs (50 iters)" "[ $ok -eq 1 ]"
+rm -f ~/.zmyth-z0; nuke wt-z0
+
+echo "── M1: \$VAR in path is literal (not shell-expanded) ──"
+"$ZMX" run wt-dol -- "cd /tmp" >/dev/null 2>&1
+rm -f '/tmp/$TMPDIR-zmyth'
+printf 'x' | timeout 10 "$ZMX" write wt-dol '$TMPDIR-zmyth' 2>&1
+"$ZMX" run wt-dol -- true >/dev/null 2>&1
+chk "\$VAR path: literal file created" "[ -f '/tmp/\$TMPDIR-zmyth' ]"
+rm -f '/tmp/$TMPDIR-zmyth'; nuke wt-dol
+
+echo "── M2: relative write rejected while a command is running (stale cwd) ──"
+old=$(mktemp -d); new=$(mktemp -d)
+"$ZMX" run wt-stale -- "cd $old" >/dev/null 2>&1
+"$ZMX" run -d wt-stale -- "cd $new && sleep 2" >/dev/null 2>&1
+sleep 0.3
+printf 'x' | timeout 5 "$ZMX" write wt-stale 'rel.txt' 2>/dev/null; wec=$?
+"$ZMX" wait wt-stale >/dev/null 2>&1
+chk "stale-cwd: write during running cmd rejected" "[ $wec -ne 0 ]"
+chk "stale-cwd: file NOT in old dir" "[ ! -f '$old/rel.txt' ]"
+nuke wt-stale; rm -rf "$old" "$new"
+
 echo "── abort: client dies mid-write → session recovers ──"
 head -c 10485760 /dev/urandom > "$src"; rm -f "$dst"
 ZMYTH_WRITE_FORCE_PTY=1 "$ZMX" run wt-abort -- "cd $(dirname "$dst")" >/dev/null 2>&1

@@ -54,7 +54,7 @@ chk ".bashrc line count == 1" '[ "$(grep -c zmyth $HOME/.bashrc)" -eq 1 ]' '$(ca
 "$ZMYTH" send "$S" $'echo POST:$__ZMYTH_HOOK_V:\n' >/dev/null
 read_until "$S" '^POST:' || die "POST marker never appeared"
 post=$("$ZMYTH" read "$S" -n 5 | grep -a "^POST:" | tail -1)
-chk "inner shell now has __ZMYTH_HOOK_V=1" '[ "$post" = "POST:1:" ]' '$post'
+chk "inner shell now has __ZMYTH_HOOK_V set" 'echo "$post" | grep -qE "^POST:[1-9][0-9]*:$"' '$post'
 
 # Body did NOT leak into scrollback. The OUTER local-spawn inject is visible
 # (twice: kernel-echo + readline-echo — pre-existing, not under test here),
@@ -172,7 +172,7 @@ nuke "$S"
 out=$(env TERM=dumb bash --norc -c '. src2/assets/hook.bash; echo "v=$__ZMYTH_HOOK_V"' 2>&1)
 chk "M5: TERM=dumb → hook inert (var unset)" 'echo "$out" | grep -q "^v=$"' '$out'
 out=$(env TERM=xterm-256color bash --norc -c '. src2/assets/hook.bash; echo "v=$__ZMYTH_HOOK_V"' 2>&1)
-chk "M5: TERM=xterm → hook active" 'echo "$out" | grep -q "^v=1$"' '$out'
+chk "M5: TERM=xterm → hook active" 'echo "$out" | grep -qE "^v=[1-9][0-9]*$"' '$out'
 
 # ─── case 5: error — not at a shell prompt (python REPL) ──────────────────
 echo "── error: not a shell ──"

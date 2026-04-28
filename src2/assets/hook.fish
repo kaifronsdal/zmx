@@ -1,5 +1,5 @@
 if not set -q __ZMYTH_HOOK_V; and set -q TERM; and test "$TERM" != dumb
-  set -g __ZMYTH_HOOK_V 1
+  set -g __ZMYTH_HOOK_V 2
   set -g __ZMX_CAP f
   command -v gunzip >/dev/null 2>&1; and set -g __ZMX_CAP fg
   function __zmx_preexec --on-event fish_preexec

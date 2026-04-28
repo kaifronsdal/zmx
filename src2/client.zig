@@ -832,12 +832,7 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const sock = connectOrFail(allocator, name, "write") orelse return 1;
     defer posix.close(sock);
 
-    var hdr: std.ArrayList(u8) = .empty;
-    defer hdr.deinit(allocator);
-    const raw_len: u64 = raw.items.len;
-    try hdr.appendSlice(allocator, std.mem.asBytes(&std.mem.nativeToLittle(u64, raw_len)));
-    try hdr.appendSlice(allocator, path);
-    try ipc.sendBlocking(sock, .write_hdr, hdr.items);
+    try ipc.sendBlocking(sock, .write_hdr, path);
 
     // Daemon replies with the mode it can support: 'L' (local-FS direct),
     // 'z' (PTY, gunzip available), 'p' (PTY, plain only). Compression

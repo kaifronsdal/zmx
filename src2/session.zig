@@ -204,6 +204,12 @@ pub const Session = struct {
     /// count, since it can't relay the query.
     attached_clients: u32 = 0,
 
+    /// Monotonic count of `preexec` events. Lets the daemon detect "preexec
+    /// arrived since I last looked" even when preexec+done land in the same
+    /// `feedPtyOutput` (so `cmd_running` is already false by the time it
+    /// checks).
+    preexec_count: u64 = 0,
+
     /// In-flight `zmyth hook` install (probe → install → wait for done).
     hook_pending: ?HookPending = null,
     hook_completed: ?HookCompletion = null,
@@ -365,6 +371,7 @@ pub const Session = struct {
     }
 
     fn onPreexec(self: *Session, pid: i32) void {
+        self.preexec_count += 1;
         const depth: u8 = self.findLayer(pid) orelse blk: {
             _ = self.pushLayer(.{ .pid = pid, .hooked = true });
             break :blk self.topDepth();
@@ -443,12 +450,16 @@ pub const Session = struct {
             return;
         }
         if (self.sentAt(depth)) |r| {
-            // A `done` arriving before our bytes have even reached the PTY
-            // is from something else (^C at the prompt, write-abort cleanup)
-            // — don't credit it. We can't gate on `accepted`: bash's DEBUG
-            // trap doesn't fire for subshells/group commands, so `(exit 42)`
-            // legitimately produces `done` without `preexec`.
-            if (r.flushed_ns == 0) return;
+            // A `done` that arrives before our bytes could possibly have
+            // reached the shell is from something else (^C at the prompt,
+            // write-abort cleanup). Either signal proves they did:
+            //   - `accepted`: preexec arrived, so the shell read the line;
+            //   - `flushed_ns`: pty_input fully drained after typing.
+            // Neither alone is sufficient as a gate: bash's DEBUG trap skips
+            // `(subshells)` so `accepted` may stay false for a real command;
+            // and a concurrent `.send` queued behind the command can leave
+            // pty_input non-empty so `flushed_ns` stays 0.
+            if (!r.accepted and r.flushed_ns == 0) return;
             const req = self.removeReq(r);
             try self.complete(req, .{ .exit_code = d.exit_code, .via = .osc_done, .dur_ms = d.dur_ms });
         }
@@ -1237,6 +1248,30 @@ test "done without preexec is not credited to a typed-but-unaccepted request" {
     try testing.expectEqual(@as(?i32, 0), s.completions()[0].result.exit_code);
 }
 
+test "H1: done is credited when command flushed but trailing send is not" {
+    // consumePtyInput only stamps flushed_ns on FULL drain. A concurrent
+    // `.send` queued behind the typed command can leave the buffer non-empty
+    // even after the command bytes reached the PTY. preexec arriving is
+    // itself proof the bytes landed, so the done must still be credited.
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    try s.queueRun(1, "true", false);
+    const cmd_len = s.pendingPtyInput().len;
+    try s.queueSend("# tail the kernel PTY buffer didn't accept yet\n");
+    s.consumePtyInput(cmd_len); // command flushed; send still pending
+    try testing.expect(s.pendingPtyInput().len > 0);
+    try testing.expectEqual(@as(i128, 0), s.run_queue.items[0].flushed_ns);
+
+    var b: [128]u8 = undefined;
+    try s.feedPtyOutput(preexecOsc(&b, TPID));
+    try testing.expect(s.run_queue.items[0].accepted);
+    try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 1));
+    try testing.expectEqual(@as(usize, 1), s.completions().len);
+    try testing.expectEqual(@as(?i32, 0), s.completions()[0].result.exit_code);
+}
+
 test "?2004h-then-done split across reads: request typed in gap is upgraded" {
     // fish emits ?2004h and the hook's first `done` as separate writes; if a
     // queued run is typed after onPrompt but before onDone, it captured
@@ -1375,12 +1410,16 @@ test "hook: probe reports already hooked → no install typed" {
     // arrives between them. echo_swallow ensures the done isn't taken as the
     // install completion.
     try s.feedPtyOutput(preexecOsc(&b, TPID));
-    try s.feedPtyOutput("\x1b]2718;probe;b=5.2,z=,f=,h=1\x07");
+    try s.feedPtyOutput(std.fmt.bufPrint(
+        &b,
+        "\x1b]2718;probe;b=5.2,z=,f=,h={d}\x07",
+        .{shell.hook_version},
+    ) catch unreachable);
     try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
 
     const c = s.takeHookCompletion().?;
     try testing.expectEqual(@as(u32, 7), c.client_id);
-    try testing.expectEqual(@as(u32, 1), c.result.already_hooked);
+    try testing.expectEqual(shell.hook_version, c.result.already_hooked);
     try testing.expect(s.hook_pending == null);
     // No install was typed.
     try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
@@ -1495,7 +1534,11 @@ test "queueRun while hook_pending defers typing" {
     // Probe says already-hooked → hook completes.
     var b: [128]u8 = undefined;
     try s.feedPtyOutput(preexecOsc(&b, TPID));
-    try s.feedPtyOutput("\x1b]2718;probe;b=5.2,z=,f=,h=1\x07");
+    try s.feedPtyOutput(std.fmt.bufPrint(
+        &b,
+        "\x1b]2718;probe;b=5.2,z=,f=,h={d}\x07",
+        .{shell.hook_version},
+    ) catch unreachable);
     try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 0));
     try testing.expect(s.takeHookCompletion() != null);
     // Now the queued run is typed.
