@@ -96,9 +96,12 @@ const RunRequest = struct {
     expect_preexec: bool = false,
     /// nanoTimestamp when typed.
     started_ns: i128 = 0,
-    /// nanoTimestamp when pty_input drained to empty after typing (i.e. the
-    /// bytes have actually hit the PTY). 0 = not yet. Acceptance timeout is
-    /// measured from here, not started_ns.
+    /// `pty_input` write position at type-time. The request is *flushed*
+    /// once `pty_bytes_flushed >= flush_mark` — its bytes have reached the
+    /// PTY regardless of what's queued behind them.
+    flush_mark: u64 = 0,
+    /// nanoTimestamp when `flush_mark` was reached. 0 = not yet. The
+    /// acceptance timeout is measured from here.
     flushed_ns: i128 = 0,
 };
 
@@ -221,6 +224,11 @@ pub const Session = struct {
     /// memmove-shifting on every partial PTY write; the buffer is compacted
     /// only on full drain or when the dead prefix grows large.
     pty_input_pos: usize = 0,
+    /// Monotonic count of bytes ever written to the PTY. A request is
+    /// flushed once this passes its `flush_mark` — independent of whatever
+    /// is queued *behind* it (so a `.send` after a typed `run` doesn't hide
+    /// the run's flush).
+    pty_bytes_flushed: u64 = 0,
     run_queue: std.ArrayList(RunRequest),
     completed: std.ArrayList(Completion),
     /// Scratch reused across feedPtyOutput calls.
@@ -454,16 +462,11 @@ pub const Session = struct {
             return;
         }
         if (self.sentAt(depth)) |r| {
-            // A `done` that arrives before our bytes could possibly have
-            // reached the shell is from something else (^C at the prompt,
-            // write-abort cleanup). Either signal proves they did:
-            //   - `accepted`: preexec arrived, so the shell read the line;
-            //   - `flushed_ns`: pty_input fully drained after typing.
-            // Neither alone is sufficient as a gate: bash's DEBUG trap skips
-            // `(subshells)` so `accepted` may stay false for a real command;
-            // and a concurrent `.send` queued behind the command can leave
-            // pty_input non-empty so `flushed_ns` stays 0.
-            if (!r.accepted and r.flushed_ns == 0) return;
+            // A `done` that arrives before our bytes have reached the PTY
+            // is from something else (^C at the prompt, write-abort cleanup).
+            // `flushed_ns` is exact (per-request flush_mark, independent of
+            // what's queued behind), so this is a sufficient gate on its own.
+            if (r.flushed_ns == 0) return;
             const req = self.removeReq(r);
             try self.complete(req, .{ .exit_code = d.exit_code, .via = .osc_done, .dur_ms = d.dur_ms });
         }
@@ -589,18 +592,21 @@ pub const Session = struct {
     /// write to the master).
     pub fn consumePtyInput(self: *Session, n: usize) void {
         self.pty_input_pos += n;
+        self.pty_bytes_flushed += n;
         assert(self.pty_input_pos <= self.pty_input.items.len);
+
+        // Stamp flushed_ns on any request whose bytes have now cleared the
+        // PTY, regardless of what's queued behind them.
+        const now = std.time.nanoTimestamp();
+        for (self.run_queue.items) |*r| {
+            if (r.sent and r.flushed_ns == 0 and self.pty_bytes_flushed >= r.flush_mark)
+                r.flushed_ns = now;
+        }
+
         const rem = self.pty_input.items.len - self.pty_input_pos;
         if (rem == 0) {
             self.pty_input.clearRetainingCapacity();
             self.pty_input_pos = 0;
-            // The acceptance-timeout window opens once the typed bytes have
-            // actually reached the PTY. Any sent-but-unflushed request
-            // qualifies (with layers there can be at most one).
-            const now = std.time.nanoTimestamp();
-            for (self.run_queue.items) |*r| if (r.sent and r.flushed_ns == 0) {
-                r.flushed_ns = now;
-            };
         } else if (self.pty_input_pos > 64 * 1024) {
             std.mem.copyForwards(u8, self.pty_input.items[0..rem], self.pty_input.items[self.pty_input_pos..]);
             self.pty_input.shrinkRetainingCapacity(rem);
@@ -891,6 +897,7 @@ pub const Session = struct {
         try self.pty_input.appendSlice(self.gpa, "\x1b[201~\r");
         req.sent = true;
         req.started_ns = std.time.nanoTimestamp();
+        req.flush_mark = self.pty_bytes_flushed + self.pendingPtyInput().len;
         req.layer_depth = self.topDepth();
         req.expect_preexec = self.top().?.hooked;
     }
@@ -1257,11 +1264,10 @@ test "done without preexec is not credited to a typed-but-unaccepted request" {
     try testing.expectEqual(@as(?i32, 0), s.completions()[0].result.exit_code);
 }
 
-test "H1: done is credited when command flushed but trailing send is not" {
-    // consumePtyInput only stamps flushed_ns on FULL drain. A concurrent
-    // `.send` queued behind the typed command can leave the buffer non-empty
-    // even after the command bytes reached the PTY. preexec arriving is
-    // itself proof the bytes landed, so the done must still be credited.
+test "R-flush: per-request flush_mark — trailing send doesn't hide flush" {
+    // A `.send` queued behind a typed command leaves pty_input non-empty
+    // after the command's bytes have drained. flushed_ns is keyed on the
+    // request's own flush_mark, so it's stamped at the partial drain.
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
     try hookAndIdle(&s);
@@ -1271,11 +1277,10 @@ test "H1: done is credited when command flushed but trailing send is not" {
     try s.queueSend("# tail the kernel PTY buffer didn't accept yet\n");
     s.consumePtyInput(cmd_len); // command flushed; send still pending
     try testing.expect(s.pendingPtyInput().len > 0);
-    try testing.expectEqual(@as(i128, 0), s.run_queue.items[0].flushed_ns);
+    try testing.expect(s.run_queue.items[0].flushed_ns != 0);
 
     var b: [128]u8 = undefined;
     try s.feedPtyOutput(preexecOsc(&b, TPID));
-    try testing.expect(s.run_queue.items[0].accepted);
     try s.feedPtyOutput(doneOsc(&b, TPID, 0, "/", 1));
     try testing.expectEqual(@as(usize, 1), s.completions().len);
     try testing.expectEqual(@as(?i32, 0), s.completions()[0].result.exit_code);

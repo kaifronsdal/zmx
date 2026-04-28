@@ -417,7 +417,7 @@ fn runLoop(d: *Daemon) !void {
         }
 
         // ── pty_fd ───────────────────────────────────────────────────
-        if (try servicePty(d, d.pollfds.items[idx_pty].revents, &read_buf, now)) break;
+        if (try servicePty(d, d.pollfds.items[idx_pty].revents, &read_buf)) break;
 
         // ── client fds ───────────────────────────────────────────────
         // Only iterate clients that existed when pollfds was built.
@@ -462,6 +462,40 @@ fn runLoop(d: *Daemon) !void {
 
         reapChildren(d);
         reapClosedClients(d, now);
+        assessClients(d, now);
+    }
+}
+
+/// Per-tick client-health assessment: detect stalled clients (backlog not
+/// draining for `stall_window`), drop the unrecoverable ones, demote a
+/// stalled leader, count healthy attaches for headless DSR, and elect a
+/// leader if there isn't one. Runs every loop tick — not only when the PTY
+/// produces output — so a stalled leader on a quiet session is still
+/// demoted, and a recovered client is re-eligible promptly.
+fn assessClients(d: *Daemon, now: i128) void {
+    var healthy_attached: u32 = 0;
+    for (d.clients.items) |*c| {
+        if (c.closed) continue;
+        const stalled = c.stalled(now);
+        if (stalled and c.framer.pendingWrite().len > client_drop_backlog) {
+            log.warn("client {d} stalled with >{d}MiB backlog; dropping", .{ c.id, client_drop_backlog >> 20 });
+            queueOrClose(c, .err, "output backlog exceeded; detaching");
+            c.closed = true;
+            continue;
+        }
+        if (stalled and d.leader_id == c.id) {
+            log.warn("client {d} stalled; demoting leader", .{c.id});
+            d.leader_id = null;
+        }
+        if (c.attached and !stalled) healthy_attached += 1;
+    }
+    d.session.attached_clients = healthy_attached;
+
+    if (d.leader_id == null) {
+        for (d.clients.items) |*c| if (c.attached and !c.closed and !c.stalled(now)) {
+            d.promoteLeader(c);
+            break;
+        };
     }
 }
 
@@ -478,7 +512,7 @@ fn readNb(fd: posix.fd_t, buf: []u8) ?usize {
 
 /// Drain queued PTY input (POLLOUT), then read PTY output (POLLIN/HUP) and
 /// broadcast it. Returns true on PTY EOF — caller breaks the poll loop.
-fn servicePty(d: *Daemon, re: i16, read_buf: []u8, now: i128) !bool {
+fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
     if (re & posix.POLL.OUT != 0) {
         const pending = d.session.pendingPtyInput();
         if (pending.len > 0) {
@@ -501,36 +535,15 @@ fn servicePty(d: *Daemon, re: i16, read_buf: []u8, now: i128) !bool {
         return true;
     }
     const data = read_buf[0..n];
-    // Recount before each feed: a stalled client's terminal won't relay
-    // query replies, so it doesn't count as "someone who'll answer."
-    d.session.attached_clients = blk: {
-        var k: u32 = 0;
-        for (d.clients.items) |*c| {
-            if (c.attached and !c.closed and !c.stalled(now)) k += 1;
-        }
-        break :blk k;
-    };
     d.session.feedPtyOutput(data) catch |e| {
         // ghostty alloc failure: drop this chunk, keep the daemon alive.
         log.warn("feedPtyOutput: {s}; dropping {d}B", .{ @errorName(e), data.len });
     };
     releaseWriteAck(d);
-    // Broadcast to clients that want live output.
+    // Broadcast to clients that want live output. Health (stall/demote) is
+    // assessed once per loop tick in assessClients, not here.
     for (d.clients.items) |*c| {
-        if (!c.wants_output or c.closed) continue;
-        if (c.stalled(now)) {
-            if (c.framer.pendingWrite().len > client_drop_backlog) {
-                log.warn("client {d} stalled with >{d}MiB backlog; dropping", .{ c.id, client_drop_backlog >> 20 });
-                queueOrClose(c, .err, "output backlog exceeded; detaching");
-                c.closed = true;
-                continue;
-            }
-            if (d.leader_id == c.id) {
-                log.warn("client {d} stalled; demoting leader", .{c.id});
-                d.leader_id = null; // reapClosedClients re-elects
-            }
-        }
-        queueOrClose(c, .output, data);
+        if (c.wants_output and !c.closed) queueOrClose(c, .output, data);
     }
     routeCompletions(d);
     return false;
@@ -713,17 +726,6 @@ fn reapClosedClients(d: *Daemon, now: i128) void {
         c.framer.deinit();
         posix.close(c.fd);
         _ = d.clients.swapRemove(i);
-    }
-    // Promote a new leader if the old one was reaped or demoted. Only a
-    // non-stalled client is eligible — re-electing a stalled one would
-    // demote→re-elect→resize+SIGWINCH every poll tick. With no eligible
-    // client, leave leader_id null: the PTY stays at its last size until a
-    // healthy client appears or types (handleInput).
-    if (d.leader_id == null) {
-        for (d.clients.items) |*nc| if (nc.attached and !nc.closed and !nc.stalled(now)) {
-            d.promoteLeader(nc);
-            break;
-        };
     }
 }
 

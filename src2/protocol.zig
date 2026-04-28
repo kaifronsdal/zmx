@@ -217,8 +217,14 @@ pub const Scanner = struct {
             const pid_s = it.next() orelse return;
             const ec_s = it.next() orelse return;
             const dur_s = it.next() orelse return;
-            const sh_s = it.next() orelse return;
-            const cwd = it.rest(); // last field; may contain ';'
+            // Pre-v2 hooks emit 4 fields (no cap): `done;pid;ec;dur;cwd`.
+            // cwd is `$PWD` (absolute, leading `/`); cap is 1-2 letters.
+            // So: if the next field starts with `/`, it's a v1 cwd.
+            const f4 = it.rest();
+            const v1 = f4.len > 0 and f4[0] == '/';
+            const sep = if (v1) null else std.mem.indexOfScalar(u8, f4, ';');
+            const cap = if (sep) |s| f4[0..s] else if (v1) "" else f4;
+            const cwd = if (sep) |s| f4[s + 1 ..] else if (v1) f4 else "";
             const pid = std.fmt.parseInt(i32, pid_s, 10) catch return;
             const ec = std.fmt.parseInt(i32, ec_s, 10) catch return;
             const dur_i = std.fmt.parseInt(i64, dur_s, 10) catch return;
@@ -230,16 +236,13 @@ pub const Scanner = struct {
                 .exit_code = ec,
                 .cwd = self.cwd_storage.items[off..],
                 .dur_ms = @intCast(@max(0, dur_i)),
-                .shell = if (sh_s.len > 0) switch (sh_s[0]) {
+                .shell = if (cap.len > 0) switch (cap[0]) {
                     'b' => .bash,
                     'z' => .zsh,
                     'f' => .fish,
                     else => .unknown,
                 } else .unknown,
-                // Pre-v2 hooks emit 4 fields (no cap), so `sh_s` is the cwd.
-                // Don't let a 'g' in the path read as gunzip.
-                .has_gunzip = sh_s.len >= 2 and sh_s.len <= 4 and
-                    std.mem.indexOfScalar(u8, sh_s[1..], 'g') != null,
+                .has_gunzip = std.mem.indexOfScalar(u8, cap, 'g') != null,
             } });
         } else if (std.mem.eql(u8, kind, "probe")) {
             try out.append(self.gpa, .{ .probe = parseProbe(it.rest()) });
