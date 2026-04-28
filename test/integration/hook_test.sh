@@ -151,21 +151,24 @@ chk "H4: hook file overwritten (not STALE)" \
     '$(head -1 $HOME/.config/zmyth/hook.bash)'
 nuke "$S"
 
-# M4/file-existence: hook file already exists → rc NOT touched again, even
-# when the rc line has been moved elsewhere (so a grep would miss it).
-rm -f "$HOME/.bashrc" "$HOME/.config/zmyth/hook.bash"; : > "$HOME/.bashrc"
+# H3/I1: rc line is [ -f ]-guarded and prefixed with \n so a user rc lacking
+# a trailing newline isn't corrupted. Idempotency: re-running hook doesn't
+# duplicate the line (grep-gate).
+rm -f "$HOME/.bashrc" "$HOME/.config/zmyth/hook.bash"
+printf 'export EXISTING=1' > "$HOME/.bashrc"   # no trailing \n
 S=hkrt; SHELL=$(command -v bash) "$ZMYTH" run "$S" -- true >/dev/null 2>&1
 wait_idle "$S" || die "outer never hooked"
 "$ZMYTH" send "$S" $'exec bash --norc -i\n' >/dev/null; sleep 0.4   # unhooked inner
 "$ZMYTH" hook "$S" >/dev/null 2>&1
 chk "H3: appended rc line is [ -f ] guarded" \
     'grep -q "\[ -f .*hook.bash \] && \." "$HOME/.bashrc"' '$(cat $HOME/.bashrc)'
-# Simulate: user moved the line to .bash_profile (blank .bashrc).
-: > "$HOME/.bashrc"
-"$ZMYTH" send "$S" $'exec bash --norc -i\n' >/dev/null; sleep 0.4   # unhooked inner
+chk "I1: existing line not corrupted (leading \\n on append)" \
+    '[ "$(head -1 "$HOME/.bashrc")" = "export EXISTING=1" ]' '$(cat -A $HOME/.bashrc)'
+# Re-run: line already present → not duplicated.
+"$ZMYTH" send "$S" $'exec bash --norc -i\n' >/dev/null; sleep 0.4
 "$ZMYTH" hook "$S" >/dev/null 2>&1
-chk "M4: hook file exists → blank rc stays blank" '[ ! -s "$HOME/.bashrc" ]' \
-    '$(cat $HOME/.bashrc)'
+chk "M4: re-run does not duplicate rc line" \
+    '[ "$(grep -c zmyth/hook "$HOME/.bashrc")" -eq 1 ]' '$(cat $HOME/.bashrc)'
 nuke "$S"
 
 # M5: hook is inert under TERM=dumb

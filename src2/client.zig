@@ -195,6 +195,27 @@ fn handleSigwinch(_: c_int) callconv(.c) void {
     compat.notifySignal();
 }
 
+/// Set by `attach()` once raw mode / alt-screen are active, so a TERM/HUP
+/// arriving mid-attach can restore the outer terminal before dying. Defers
+/// don't run on signal death, and leaving the user's tty raw + alt-screen
+/// is the worst failure mode an attach can have.
+var attach_tty: struct {
+    raw: ?pty.RawMode = null,
+    alt_screen_fd: ?posix.fd_t = null,
+} = .{};
+
+fn handleFatal(sig: c_int) callconv(.c) void {
+    if (attach_tty.alt_screen_fd) |fd| _ = posix.write(fd, "\x1b[?1049l") catch {};
+    if (attach_tty.raw) |*r| r.leave();
+    // Re-raise with default disposition so the parent sees the right status.
+    posix.sigaction(@intCast(sig), &.{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+    posix.raise(@intCast(sig)) catch posix.exit(128 + @as(u8, @intCast(sig)));
+}
+
 /// Install handlers and block SIGWINCH; returns the pre-block mask for ppoll
 /// so the signal is delivered atomically inside the wait — closing the
 /// check-flag/ppoll race on an idle attach. On platforms without ppoll the
@@ -202,19 +223,17 @@ fn handleSigwinch(_: c_int) callconv(.c) void {
 fn installSignals() !posix.sigset_t {
     try compat.initSignalPipe();
 
-    const winch: posix.Sigaction = .{
-        .handler = .{ .handler = handleSigwinch },
+    inline for (.{
+        .{ posix.SIG.WINCH, handleSigwinch },
+        .{ posix.SIG.PIPE, posix.SIG.IGN },
+        .{ posix.SIG.TERM, handleFatal },
+        .{ posix.SIG.HUP, handleFatal },
+        .{ posix.SIG.INT, handleFatal },
+    }) |s| posix.sigaction(s[0], &.{
+        .handler = .{ .handler = s[1] },
         .mask = posix.sigemptyset(),
         .flags = 0,
-    };
-    posix.sigaction(posix.SIG.WINCH, &winch, null);
-
-    const ign: posix.Sigaction = .{
-        .handler = .{ .handler = posix.SIG.IGN },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.PIPE, &ign, null);
+    }, null);
 
     var to_block = posix.sigemptyset();
     posix.sigaddset(&to_block, posix.SIG.WINCH);
@@ -287,13 +306,22 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const stdout_tty = posix.isatty(stdout_fd);
     const stdin_tty = posix.isatty(stdin_fd);
 
-    var raw: ?pty.RawMode = if (stdin_tty) try pty.RawMode.enter(stdin_fd) else null;
-    defer if (raw) |*r| r.leave();
-
-    if (stdout_tty) try writeAllFd(stdout_fd, "\x1b[?1049h\x1b[2J\x1b[H");
-    defer if (stdout_tty) writeAllFd(stdout_fd, "\x1b[?1049l") catch {};
-
     const ppoll_mask = try installSignals();
+
+    if (stdin_tty) attach_tty.raw = try pty.RawMode.enter(stdin_fd);
+    defer if (attach_tty.raw) |*r| {
+        r.leave();
+        attach_tty.raw = null;
+    };
+
+    if (stdout_tty) {
+        try writeAllFd(stdout_fd, "\x1b[?1049h\x1b[2J\x1b[H");
+        attach_tty.alt_screen_fd = stdout_fd;
+    }
+    defer if (attach_tty.alt_screen_fd) |fd| {
+        writeAllFd(fd, "\x1b[?1049l") catch {};
+        attach_tty.alt_screen_fd = null;
+    };
 
     // Make socket nonblocking for the Framer-driven pump.
     try io.setNonBlock(sock, true);

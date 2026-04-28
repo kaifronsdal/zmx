@@ -989,7 +989,7 @@ fn handleWriteBegin(d: *Daemon, c: *Client, payload: []const u8) !void {
     const gzip = payload[0] == 'z';
     const enc_len = std.mem.readInt(u64, payload[1..9], .little);
 
-    const opener = try shell.writeOpener(d.gpa, w.path, enc_len, gzip);
+    const opener = try shell.writeOpener(d.gpa, d.session.topShell(), w.path, enc_len, gzip);
     defer d.gpa.free(opener);
     try d.session.queueSend(opener);
 

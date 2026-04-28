@@ -116,31 +116,33 @@ pub fn buildInstall(allocator: std.mem.Allocator, shell: Shell) ![]u8 {
     errdefer out.deinit(allocator);
     const w = out.writer(allocator);
     try w.writeAll(paste_open);
+    // Three-line install:
+    //   1. mkdir + read body to a temp file (drain-wrapped so a write
+    //      failure doesn't leave the body for readline to execute)
+    //   2. atomic mv into place — a half-written hook is never sourced;
+    //      then append the rc line ON SUCCESS with a leading \n so a user
+    //      rc lacking a trailing newline isn't corrupted
+    //   3. source it
+    // The rc line itself is `[ -f ] &&`-guarded so `rm -rf ~/.config/zmyth`
+    // is a clean uninstall. rc-append is grep-gated rather than file-gated
+    // so a failed line-2 retry doesn't accumulate duplicates.
     switch (shell) {
         .bash, .zsh => {
-            // ZDOTDIR: zsh reads $ZDOTDIR/.zshrc, not ~/.zshrc, when set.
             const rc = if (shell == .bash) "~/.bashrc" else "\"${ZDOTDIR:-$HOME}/.zshrc\"";
             const ext = @tagName(shell);
-            // rc-append gated on hook-file existence, not grep: a user who
-            // moved/commented the line, or sources it from .bash_profile,
-            // shouldn't get a duplicate. The appended line is itself
-            // `[ -f ] &&`-guarded so a later `rm -rf ~/.config/zmyth`
-            // uninstall leaves no broken-source error. `>|` survives
-            // `set -o noclobber` on upgrade.
             try w.print(
-                "mkdir -p {s}; [ -f {s}/hook.{s} ] || echo '{s}' >> {s}\n" ++
-                    "stty -echo; head -c {d} | tr '\\r' '\\n' >| {s}/hook.{s}; stty echo\n" ++
-                    ". {s}/hook.{s}",
-                .{ hook_dir, hook_dir, ext, rcSourceLine(shell), rc, body.len, hook_dir, ext, hook_dir, ext },
+                "mkdir -p {0s}; stty -echo; head -c {1d} | {{ tr '\\r' '\\n' >| {0s}/hook.tmp || cat >/dev/null; }}; stty echo\n" ++
+                    "mv -f {0s}/hook.tmp {0s}/hook.{2s} && {{ grep -q zmyth/hook {3s} 2>/dev/null || printf '\\n%s\\n' '{4s}' >> {3s}; }}\n" ++
+                    ". {0s}/hook.{2s}",
+                .{ hook_dir, body.len, ext, rc, rcSourceLine(shell) },
             );
         },
         .fish => try w.print(
-            // fish has no noclobber (`>` always overwrites) and conf.d/ is
-            // ours alone, so plain `>` and unconditional rewrite are fine.
-            "mkdir -p {s} ~/.config/fish/conf.d; echo '{s}' > ~/.config/fish/conf.d/zmyth.fish\n" ++
-                "stty -echo; head -c {d} | tr '\\r' '\\n' > {s}/hook.fish; stty echo\n" ++
-                "source {s}/hook.fish",
-            .{ hook_dir, rcSourceLine(.fish), body.len, hook_dir, hook_dir },
+            // fish: conf.d/ is ours alone so unconditional rewrite is fine.
+            "mkdir -p {0s} ~/.config/fish/conf.d; stty -echo; head -c {1d} | begin; tr '\\r' '\\n' > {0s}/hook.tmp; or cat >/dev/null; end; stty echo\n" ++
+                "mv -f {0s}/hook.tmp {0s}/hook.fish; and printf '%s\\n' '{2s}' > ~/.config/fish/conf.d/zmyth.fish\n" ++
+                "source {0s}/hook.fish",
+            .{ hook_dir, body.len, rcSourceLine(.fish) },
         ),
         .unknown => unreachable,
     }
@@ -169,20 +171,40 @@ pub fn buildInstall(allocator: std.mem.Allocator, shell: Shell) ![]u8 {
 // same kernel-buffer-full as the command itself (line editors over-read
 // whatever is available).
 
-/// `^U ⟨paste⟩stty -icanon -echo; head -c N | base64 -d [| gunzip] > 'path';
-/// stty icanon echo⟨/paste⟩\r`. `n` is the byte length of the encoded body
-/// (incl. `\n` per line). Caller then streams exactly `n` bytes. Caller
-/// frees.
-pub fn writeOpener(allocator: Allocator, path: []const u8, n: u64, gzip: bool) ![]u8 {
+/// `^U ⟨paste⟩stty -icanon -echo; head -c N | <drain decode> ; stty icanon
+/// echo⟨/paste⟩\r`. `n` is the byte length of the encoded body. Caller then
+/// streams exactly `n` bytes. Caller frees.
+///
+/// The decode stage is wrapped so the pipe is *always* drained: if the
+/// redirect fails (typo'd path, EACCES, zsh `~nosuchuser`), `head` would
+/// otherwise SIGPIPE early and the unread body would flood readline. The
+/// `|| cat >/dev/null` swallows the rest so `head -c N` always completes
+/// and `stty icanon echo` always runs.
+pub fn writeOpener(allocator: Allocator, sh: Shell, path: []const u8, n: u64, gzip: bool) ![]u8 {
     const q = try quoteRedirectTarget(allocator, path);
     defer allocator.free(q);
-    return std.fmt.allocPrint(
-        allocator,
-        paste_open ++
-            "stty -icanon -echo; head -c {d} | base64 -d{s} > {s}; stty icanon echo" ++
-            paste_close,
-        .{ n, if (gzip) " | gunzip" else "", q },
-    );
+    const gz = if (gzip) " | gunzip" else "";
+    return switch (sh) {
+        .fish => std.fmt.allocPrint(
+            allocator,
+            paste_open ++
+                "stty -icanon -echo; head -c {d} | begin; base64 -d{s} > {s} 2>/dev/null; " ++
+                "or cat >/dev/null; end; stty icanon echo" ++
+                paste_close,
+            .{ n, gz, q },
+        ),
+        // `setopt nonomatch` (zsh) makes a failed `~user` expansion fall
+        // through to a literal (then ENOENT → caught by `||`) instead of
+        // aborting the whole list. No-op in bash (`2>/dev/null`).
+        else => std.fmt.allocPrint(
+            allocator,
+            paste_open ++
+                "stty -icanon -echo; head -c {d} | {{ setopt nonomatch 2>/dev/null; " ++
+                "base64 -d{s} > {s} 2>/dev/null || cat >/dev/null; }}; stty icanon echo" ++
+                paste_close,
+            .{ n, gz, q },
+        ),
+    };
 }
 
 /// Quote `path` for use as a redirect target. A leading `~`/`~user/` prefix
@@ -238,12 +260,13 @@ pub const env_forward = [_][:0]const u8{
     "DBUS_SESSION_BUS_ADDRESS",
 };
 
-/// Subset of `env_forward` whose values are filesystem paths and so can be
-/// refreshed via symlink indirection without restarting the shell. The others
-/// (DISPLAY, DBUS_…) need an env-reload mechanism — deferred (DESIGN.md #104).
+/// Subset of `env_forward` whose values are *absolute filesystem paths* and
+/// so can be refreshed via symlink indirection without restarting the shell.
+/// WAYLAND_DISPLAY is conventionally a bare name (`wayland-0`) resolved
+/// against $XDG_RUNTIME_DIR — symlinking it would dangle. The others
+/// (DISPLAY, DBUS_…) need an env-reload mechanism (DESIGN.md #104).
 pub const refresh_env_keys = [_][]const u8{
     "SSH_AUTH_SOCK",
-    "WAYLAND_DISPLAY",
 };
 
 // ───────────────────── shell process spawn ─────────────────────
@@ -273,6 +296,12 @@ pub fn spawnShell(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Detect shell up front so the env-strip loop knows whether to take
+    // ZDOTDIR (only the zsh arm overrides it; bash/fish should inherit so
+    // a `zsh` launched later inside the session reads the right dotdir).
+    const shell_path = posix.getenv("SHELL") orelse "/bin/sh";
+    const shell: Shell = if (initial_cmd != null) .unknown else Shell.parse(std.fs.path.basename(shell_path));
+
     // Base env: inherit parent + ZMYTH_SESSION + TERM (if unset) + indirected
     // refresh keys pointing at <env_dir>/<KEY>.
     var env: std.ArrayList([*:0]const u8) = .empty;
@@ -280,10 +309,9 @@ pub fn spawnShell(
         var ptr = std.c.environ;
         while (ptr[0]) |e| : (ptr += 1) {
             const s = std.mem.span(e);
-            // Skip keys we are about to override.
-            if (envKeyIs(s, "ZMYTH_SESSION") or
-                envKeyIs(s, "_ZMYTH_ORIG_ZDOTDIR") or
-                envKeyIs(s, "ZDOTDIR")) continue;
+            if (envKeyIs(s, "ZMYTH_SESSION")) continue;
+            if (shell == .zsh and (envKeyIs(s, "_ZMYTH_ORIG_ZDOTDIR") or
+                envKeyIs(s, "ZDOTDIR"))) continue;
             var skip = false;
             for (refresh_env_keys) |k| if (envKeyIs(s, k)) {
                 skip = true;
@@ -313,12 +341,6 @@ pub fn spawnShell(
     if (initial_cmd) |cmd| {
         return .{ .pid = try pty.forkExec(p, cmd, env.items), .shell = .unknown };
     }
-
-    // Detect shell from $SHELL basename. Fall back to /bin/sh (not /bin/bash):
-    // alpine/busybox/distroless lack bash but always have sh.
-    const shell_path = posix.getenv("SHELL") orelse "/bin/sh";
-    const base = std.fs.path.basename(shell_path);
-    const shell = Shell.parse(base);
 
     std.fs.makeDirAbsolute(rc_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
@@ -381,7 +403,7 @@ pub fn spawnShell(
             try argv.appendSlice(arena, &.{ shell_path, "-i", "-C", hookBody(.fish) });
         },
         .unknown => {
-            log.warn("unknown shell '{s}'; spawning without hook", .{base});
+            log.warn("unknown shell '{s}'; spawning without hook", .{shell_path});
             try argv.appendSlice(arena, &.{ shell_path, "-i" });
         },
     }

@@ -18,6 +18,29 @@ out=$(bash --norc -ec '
 ' 2>&1)
 chk "B9: hook.bash precmd survives set -e" 'echo "$out" | grep -q SURVIVED' '$out'
 
+echo "── K1: hook survives shadowed printf ──"
+for h in bash zsh; do
+  out=$($h -c '
+    function printf { :; }
+    PROMPT_COMMAND=""
+    source '"$ASSETS"'/hook.'$h'
+    __zmx_precmd 2>&1
+  ' 2>&1 | cat -v)
+  chk "K1: $h hook emits OSC despite shadowed printf" \
+      'echo "$out" | grep -q "2718;done"' '$out'
+done
+
+echo "── K2: hook.zsh survives redefined add-zsh-hook + nounset ──"
+out=$(zsh -c '
+  setopt nounset
+  add-zsh-hook() { :; }
+  unset preexec_functions precmd_functions 2>/dev/null
+  source '"$ASSETS"'/hook.zsh
+  echo "pf=${precmd_functions[*]}"
+' 2>&1)
+chk "K2: __zmx_precmd in precmd_functions despite stub add-zsh-hook" \
+    'echo "$out" | grep -q __zmx_precmd' '$out'
+
 echo "── H4: hook.bash cap probe under set -e WITHOUT gunzip ──"
 nogz=$(mktemp -d); ln -sf "$(command -v sed)" "$nogz/sed"
 out=$(bash --norc -c '

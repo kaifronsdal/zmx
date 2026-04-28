@@ -7,7 +7,7 @@ if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
   __zmx_preexec() {
     __ZMX_RAN=1
     __ZMX_T0=${EPOCHREALTIME:-}
-    printf '\033]2718;preexec;%s\007' "$$"
+    builtin printf '\033]2718;preexec;%s\007' "$$"
   }
   __zmx_precmd() {
     local __zmx_ec=$?
@@ -20,16 +20,11 @@ if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" ]]; then
     fi
     __ZMX_RAN=0
     __ZMX_T0=
-    printf '\033]2718;done;%s;%d;%d;%s;%s\007' "$$" "$__zmx_ec" "$dur" "$__ZMX_CAP" "$PWD"
+    builtin printf '\033]2718;done;%s;%d;%d;%s;%s\007' "$$" "$__zmx_ec" "$dur" "$__ZMX_CAP" "$PWD"
   }
-  autoload -Uz add-zsh-hook 2>/dev/null
-  if typeset -f add-zsh-hook >/dev/null; then
-    add-zsh-hook preexec __zmx_preexec
-    add-zsh-hook precmd __zmx_precmd
-  else
-    preexec_functions+=(__zmx_preexec)
-    precmd_functions+=(__zmx_precmd)
-  fi
+  typeset -ga preexec_functions precmd_functions
+  preexec_functions+=(__zmx_preexec)
+  precmd_functions+=(__zmx_precmd)
   typeset -ga zle_bracketed_paste=($'\e[?2004h' $'\e[?2004l')
   bindkey -M vicmd '^[[200~' bracketed-paste 2>/dev/null
   bindkey -M vicmd '^U' kill-whole-line 2>/dev/null

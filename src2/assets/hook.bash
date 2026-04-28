@@ -12,7 +12,7 @@ if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" && "${BASH
     [[ -z "$__ZMX_AT_PROMPT" ]] && return
     __ZMX_AT_PROMPT=
     __ZMX_T0=${EPOCHREALTIME:-}
-    printf '\033]2718;preexec;%s\007' "$$"
+    builtin printf '\033]2718;preexec;%s\007' "$$"
   }
   __zmx_precmd() {
     local dur=0
@@ -27,7 +27,7 @@ if [[ -z "${__ZMYTH_HOOK_V:-}" && "${TERM-}" != dumb && -n "${TERM-}" && "${BASH
     fi
     __ZMX_T0=
     __ZMX_IN_PC=
-    printf '\033]2718;done;%s;%d;%d;%s;%s\007' "$$" "${__ZMX_EC:-$?}" "$dur" "$__ZMX_CAP" "$PWD"
+    builtin printf '\033]2718;done;%s;%d;%d;%s;%s\007' "$$" "${__ZMX_EC:-$?}" "$dur" "$__ZMX_CAP" "$PWD"
     __ZMX_AT_PROMPT=1
     return $__ZMX_EC
   }

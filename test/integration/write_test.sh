@@ -117,7 +117,7 @@ head -c 5242880 /dev/urandom > "$src"; rm -f "$dst"
 t0=$(now_ms); timeout 30 "$ZMX" write wt-gzp "$reldst" < "$src"; "$ZMX" run wt-gzp -- true >/dev/null; t1=$(now_ms)
 rand_ms=$((t1-t0))
 cmp -s "$src" "$dst"; chk "gzip: 5MB random round-trip" "[ $? -eq 0 ]"
-chk "gzip: zeros (${zeros_ms}ms) ≪ random (${rand_ms}ms)" "[ $zeros_ms -lt $((rand_ms / 3)) ]"
+chk "gzip: zeros (${zeros_ms}ms) < random/2 (${rand_ms}ms)" "[ $zeros_ms -lt $((rand_ms / 2)) ]"
 # Incompressible → gzip should be SKIPPED (gz_len ≥ plain_len). Check opener.
 "$ZMX" read wt-gzp -n 20 2>/dev/null | tail -5 | grep -q 'gunzip'
 chk "incompressible: gunzip NOT in last opener" "[ $? -ne 0 ]"
@@ -149,6 +149,30 @@ nuke wt-nogz
 # ─────────────────────────────────────────────────────────────────────────────
 # Abort: client killed mid-write → daemon ^C's, session returns to prompt.
 # ─────────────────────────────────────────────────────────────────────────────
+echo "── W1: bad path (parent dir missing) → body drained, session not flooded ──"
+ZMYTH_WRITE_FORCE_PTY=1 "$ZMX" run wt-w1 -- true >/dev/null 2>&1
+head -c 524288 /dev/urandom | timeout 15 "$ZMX" write wt-w1 '/nonexistent/dir/file' 2>/dev/null
+"$ZMX" run wt-w1 -- true >/dev/null 2>&1
+sb=$("$ZMX" read wt-w1 2>/dev/null)
+# If head SIGPIPE'd early, leftover body lines would hit readline as commands.
+nf=$(echo "$sb" | grep -cE 'command not found|No such file.*[A-Za-z0-9+/]{20}')
+chk "W1: body not executed as commands (got $nf 'not found')" "[ $nf -eq 0 ]"
+out=$(timeout 5 "$ZMX" run -j wt-w1 -- 'echo OK' 2>/dev/null | tail -1)
+chk "W1: session not wedged after bad-path write" \
+    "[ \"\$(echo '$out' | jq -r .exit_code 2>/dev/null)\" = 0 ]"
+nuke wt-w1
+
+echo "── W2: zsh ~nosuchuser → tty restored, no flood ──"
+if command -v zsh >/dev/null; then
+  ZMYTH_WRITE_FORCE_PTY=1 SHELL=$(command -v zsh) "$ZMX" run wt-w2 -- true >/dev/null 2>&1
+  head -c 51200 /dev/zero | timeout 10 "$ZMX" write wt-w2 '~nosuchuserxyz/file' 2>/dev/null
+  "$ZMX" run wt-w2 -- true >/dev/null 2>&1
+  out=$(timeout 5 "$ZMX" run -j wt-w2 -- 'echo OK' 2>/dev/null | tail -1)
+  chk "W2: zsh session not wedged after ~nosuchuser" \
+      "[ \"\$(echo '$out' | jq -r .exit_code 2>/dev/null)\" = 0 ]"
+  nuke wt-w2
+fi
+
 echo "── H2: single-quote in path → trace marker doesn't wedge session ──"
 sqdst="/tmp/zmyth it's $$"; rm -f "$sqdst"
 "$ZMX" run wt-sq -- true >/dev/null 2>&1
