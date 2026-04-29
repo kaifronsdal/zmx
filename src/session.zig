@@ -4,6 +4,31 @@
 //! Pure logic — no fds, no socket I/O. The daemon poll loop reads from the PTY
 //! master and calls `feedPtyOutput()`; it drains `pendingPtyInput()` to write
 //! back to the PTY master; it reads `completions()` to reply to clients.
+//!
+//! ## Structure
+//!
+//! Three concerns share one state machine because the OSC-2718 events
+//! (`preexec`/`done`/`prompt`) drive all three at once:
+//!
+//!   - **Layer stack** (`layers`): nested shells (local → ssh → docker …),
+//!     keyed by pid. `done` from a new pid pushes; `done` from below the
+//!     top pops. `pushLayer`/`popLayersAbove`/`findLayer`/`top*`.
+//!
+//!   - **Run queue** (`run_queue`, `completed`): `zmyth run` requests.
+//!     `queueRun` types when `canType()`; `onPreexec` marks accepted;
+//!     `onDone` completes; `checkAcceptanceTimeout`/`checkPromptWait` fail
+//!     stuck ones. The six `Via` outcomes are decided here.
+//!
+//!   - **Hook install** (`hook_pending`): `zmyth hook` probe→install→done.
+//!     `startHook`/`onProbe`/`completeHook`/`checkHookTimeout`.
+//!
+//! `feedPtyOutput()` is the integration point: it dispatches each event to
+//! `onPreexec`/`onDone`/`onPrompt`, which in turn touch all three. A
+//! `done` from a new pid, for instance, pushes a layer AND may complete a
+//! `run -i` request AND may complete a hook install — that's why these
+//! aren't three modules.
+//!
+//! Tests (~1000 lines, colocated) follow the implementation.
 
 const std = @import("std");
 const assert = std.debug.assert;
