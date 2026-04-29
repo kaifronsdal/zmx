@@ -84,12 +84,9 @@ fn hasGlobChars(s: []const u8) bool {
     return std.mem.indexOfAny(u8, s, "*?") != null;
 }
 
-/// Expand each pattern against listSessions(); literals that match nothing
-/// are passed through so the verb can report "no such session".
 /// Expand `patterns` against live sessions. Unmatched literals pass through
 /// (so `wait foo` errors at connect time with a useful message); unmatched
-/// globs are dropped. The caller is expected to treat an empty result as an
-/// error when patterns were given — `wait 'typo-*' && deploy` must not fire.
+/// globs are dropped. Callers treat an empty result as an error.
 fn resolveGlobs(allocator: Allocator, patterns: []const []const u8) ![][]const u8 {
     const sessions = try paths.listSessions(allocator);
     defer {

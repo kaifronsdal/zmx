@@ -774,12 +774,9 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
                 return queueErr(c, "run: write in progress", .{});
             }
             // The locally-spawned shell is one we don't know how to hook
-            // (e.g. dash, or bash <4 which announces as `bash-pre4`), and no
-            // nested shell has announced either. `run` would hang forever
+            // (e.g. dash), and no layer has announced. `run` would hang
             // waiting for a prompt-ready signal that never comes.
-            if (d.spawned_shell == .unknown and
-                d.session.layers.len == 0 and !d.session.seen_prompt)
-            {
+            if (d.spawned_shell == .unknown and d.session.layers.len == 0) {
                 try queueErr(
                     c,
                     "shell integration unavailable for this session " ++
@@ -801,6 +798,8 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             try d.session.queueRun(c.id, cmd, interactive);
         },
         .send => {
+            if (d.write) |w| if (w.begun)
+                return queueErr(c, "send: write in progress", .{});
             try d.session.queueSend(msg.payload);
             try c.framer.queue(.ack, "");
         },
@@ -828,6 +827,8 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             should_exit.store(true, .release);
         },
         .hook => {
+            if (d.write) |w| if (w.begun)
+                return queueErr(c, "hook: write in progress", .{});
             if (try d.session.startHook(c.id, std.time.nanoTimestamp())) |refusal| {
                 try c.framer.queue(.err, refusal);
             }
@@ -1083,7 +1084,7 @@ fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
 /// may have arrived).
 fn releaseWriteAck(d: *Daemon) void {
     const w = if (d.write) |*w| w else return;
-    if (w.local_fd != null or !w.ack_pending) return;
+    if (!w.ack_pending) return;
     if (d.session.preexec_count == w.preexec_at_begin) return;
     if (d.session.pendingPtyInput().len >= write_backpressure) return;
     w.ack_pending = false;
