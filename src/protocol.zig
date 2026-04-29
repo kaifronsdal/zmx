@@ -28,8 +28,13 @@ const OSC_START = "\x1b]";
 const BP_ON = "\x1b[?2004h";
 
 /// Longest possible partial prefix of any marker we scan for. Used to bound
-/// the tail we keep when no marker is found.
-const MAX_TAIL = 32;
+/// the tail we keep when no marker is found. Derived from the markers so
+/// adding a longer one can't silently break boundary-split detection.
+const MAX_TAIL = blk: {
+    var m = 0;
+    for (.{ OSC_START, BP_ON }) |s| m = @max(m, s.len - 1);
+    break :blk m;
+};
 /// Hard cap on an unterminated OSC payload before we give up and skip it.
 const MAX_OSC_PAYLOAD = 4096;
 
@@ -77,9 +82,11 @@ pub const Scanner = struct {
     gpa: std.mem.Allocator,
     /// Accumulator for boundary-safe scanning.
     buf: std.ArrayList(u8),
-    /// Backing storage for `done.cwd` slices emitted during the current feed().
-    /// Cleared at the top of each feed(); all cwd slices in one batch point at
-    /// disjoint ranges of this buffer.
+    /// Backing storage for `done.cwd` / `pwd` slices in emitted events.
+    /// Append-only; cleared by `recycleSlices()` or `deinit()` — never by
+    /// `feed()`, so emitted slices stay valid across feeds until the caller
+    /// explicitly recycles. Capacity is reserved at the top of each feed so
+    /// appends within one call never realloc (slices stay stable).
     cwd_storage: std.ArrayList(u8),
 
     pub fn init(allocator: std.mem.Allocator) Scanner {
@@ -92,13 +99,24 @@ pub const Scanner = struct {
         self.* = undefined;
     }
 
-    /// Append `data` to the internal buffer and emit any complete events into
-    /// `out`. Slices inside emitted events (currently only `done.cwd`) point
-    /// into scanner-owned storage valid until the next feed() call.
-    pub fn feed(self: *Scanner, data: []const u8, out: *std.ArrayList(Event)) !void {
-        // ensureTotalCapacity up front so appended cwd slices don't move.
+    /// Invalidate all previously-emitted event slices and reclaim their
+    /// storage. Call after processing a batch of events; not calling it is
+    /// safe (storage just accumulates until deinit).
+    pub fn recycleSlices(self: *Scanner) void {
         self.cwd_storage.clearRetainingCapacity();
-        try self.cwd_storage.ensureTotalCapacity(self.gpa, self.buf.items.len + data.len);
+    }
+
+    /// Append `data` to the internal buffer and emit any complete events
+    /// into `out`. Slices inside emitted events (`done.cwd`, `pwd`) point
+    /// into scanner-owned storage valid until `recycleSlices()` — the
+    /// caller decides when, so there's no implicit invalidation between
+    /// feeds.
+    pub fn feed(self: *Scanner, data: []const u8, out: *std.ArrayList(Event)) !void {
+        // Reserve up front so appended cwd slices don't move mid-feed.
+        try self.cwd_storage.ensureTotalCapacity(
+            self.gpa,
+            self.cwd_storage.items.len + self.buf.items.len + data.len,
+        );
         try self.buf.appendSlice(self.gpa, data);
 
         while (true) {

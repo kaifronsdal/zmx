@@ -13,15 +13,17 @@ const shell = @import("shell.zig");
 
 /// Floor for the line-acceptance window: nanoseconds the daemon waits, after
 /// typing a `run` command, for any acceptance signal (preexec/done/prompt).
-/// Past this, the shell is assumed to be at a continuation prompt and the line
-/// is rejected with ^C. See repros/poc-hooks/RESULTS.md "incomplete input".
+/// Past this, the shell is assumed to be at a continuation prompt and the
+/// line is rejected with ^C.
 ///
-/// The actual window is `max(this, 3 * last_preexec_latency_ns)`: a nested
-/// hooked shell over SSH can need a full network RTT for the preexec OSC, so
-/// the floor alone would spuriously ^C every command on a slow link. 1s is
-/// generous for the local continuation-prompt case this was built for while
-/// giving margin to sluggish PTYs.
-const ACCEPT_TIMEOUT_NS: i128 = 1000 * std.time.ns_per_ms;
+/// The actual window is `max(floor, 3 * last_preexec_latency_ns)`. The
+/// latency is observed (preexec arrival time) so it adapts to a nested
+/// shell over a slow link — but the *first* command at a layer has no
+/// observation yet, so it uses the higher floor; subsequent commands use
+/// the lower floor + 3× the measured RTT. A rejection itself widens the
+/// estimate so a too-short first guess doesn't stick.
+const ACCEPT_TIMEOUT_NS: i128 = 1 * std.time.ns_per_s;
+const ACCEPT_TIMEOUT_FIRST_NS: i128 = 5 * std.time.ns_per_s;
 
 /// `ReadonlyStream` is not re-exported from lib_vt; derive it.
 const VtStream = @TypeOf(@as(*vt.Terminal, undefined).vtStream());
@@ -34,11 +36,12 @@ fn EffectRet(comptime field: []const u8) type {
     ).pointer.child).@"fn".return_type.?;
 }
 
-// The handler→stream→session `@fieldParentPtr` chain below is sound only
-// while ghostty's `Stream` holds its handler by value. Guard at comptime so
-// a future ghostty change to `*Handler` fails loudly here, not as UB.
-comptime {
-    assert(@FieldType(VtStream, "handler") == VtHandler);
+/// Recover `*Session` inside an `Effects` callback. ghostty's Handler has
+/// no userdata field, but `h.terminal` is the pointer *we* set (to
+/// `&self.term`), so one hop through our own struct layout suffices —
+/// independent of how ghostty arranges Stream/Handler internally.
+inline fn sessionOf(h: *VtHandler) *Session {
+    return @alignCast(@fieldParentPtr("term", h.terminal));
 }
 
 /// `Effects.write_pty`: ghostty has computed a response to a terminal query
@@ -48,8 +51,7 @@ comptime {
 /// when there's no leader (headless or all stalled), ghostty answers here
 /// so the app doesn't hang on its query timeout.
 fn vtWritePty(h: *VtHandler, data: [:0]const u8) void {
-    const stream: *VtStream = @alignCast(@fieldParentPtr("handler", h));
-    const sess: *Session = @alignCast(@fieldParentPtr("stream", stream));
+    const sess = sessionOf(h);
     if (sess.has_leader) return;
     // OOM: drop the reply; the app will time out as it would have anyway.
     sess.pty_input.appendSlice(sess.gpa, data) catch return;
@@ -67,8 +69,7 @@ fn vtDeviceAttrs(_: *VtHandler) EffectRet("device_attributes") {
 /// no real font headlessly. Prevents image tools (chafa, timg) from sitting
 /// on a query timeout.
 fn vtSize(h: *VtHandler) EffectRet("size") {
-    const stream: *VtStream = @alignCast(@fieldParentPtr("handler", h));
-    const sess: *Session = @alignCast(@fieldParentPtr("stream", stream));
+    const sess = sessionOf(h);
     if (sess.has_leader) return null;
     return .{
         .rows = @intCast(sess.term.screens.active.pages.rows),
@@ -82,9 +83,7 @@ fn vtSize(h: *VtHandler) EffectRet("size") {
 /// overwhelmingly common terminal default. nvim 0.10+ probes this for
 /// `&background` autodetect.
 fn vtColorScheme(h: *VtHandler) EffectRet("color_scheme") {
-    const stream: *VtStream = @alignCast(@fieldParentPtr("handler", h));
-    const sess: *Session = @alignCast(@fieldParentPtr("stream", stream));
-    if (sess.has_leader) return null;
+    if (sessionOf(h).has_leader) return null;
     return .dark;
 }
 
@@ -337,6 +336,8 @@ pub const Session = struct {
             .done => |d| try self.onDone(d),
             .prompt => try self.onPrompt(),
         };
+        // setLastCwd/onDone copied any cwd slices; release scanner storage.
+        self.scanner.recycleSlices();
 
         // Type the next queued request only after all events from this chunk
         // are processed, so a trailing event in the same chunk can't be
@@ -693,10 +694,14 @@ pub const Session = struct {
         // distinguish "running" from "continuation" so don't ^C real commands.
         if (!r.expect_preexec) return false;
         if (r.flushed_ns == 0) return false;
-        // Adaptive window: 3x the last observed flush→preexec round-trip,
-        // floored at ACCEPT_TIMEOUT_NS. First command after hooking uses the
-        // floor (latency is 0); subsequent ones scale to the link.
-        const window = @max(ACCEPT_TIMEOUT_NS, 3 * self.last_preexec_latency_ns);
+        // Adaptive window: 3× the observed flush→preexec RTT. The first
+        // command at a layer has no observation, so it gets a higher floor
+        // (a 1s floor on a 1.2s-RTT link would reject *every* first command).
+        const floor = if (self.last_preexec_latency_ns == 0)
+            ACCEPT_TIMEOUT_FIRST_NS
+        else
+            ACCEPT_TIMEOUT_NS;
+        const window = @max(floor, 3 * self.last_preexec_latency_ns);
         const waited = now_ns - r.flushed_ns;
         if (waited < window) return false;
 
@@ -1104,6 +1109,8 @@ test "checkAcceptanceTimeout sends ^C and rejects" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
     try hookAndIdle(&s);
+    // Seed an observed RTT so the 1s floor applies (first-command floor is 5s).
+    s.last_preexec_latency_ns = 50 * std.time.ns_per_ms;
 
     try s.queueRun(9, "echo \"unclosed", false);
     try testing.expect(s.run_queue.items[0].sent);
@@ -1354,30 +1361,30 @@ test "?2004h-then-done split across reads: request typed in gap is upgraded" {
     try testing.expectEqual(.line_rejected, s.completions()[0].result.via);
 }
 
-test "T5: rejection widens the acceptance window for the next attempt" {
+test "first command at a layer uses the higher floor; rejection still widens" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
     try hookAndIdle(&s);
 
-    // First command on a slow link: no preexec arrives, rejected at the
-    // 1s floor.
+    // First command (no observed RTT): the 1s floor must NOT reject; the
+    // 5s first-command floor does.
     try s.queueRun(1, "a", false);
     s.consumePtyInput(s.pendingPtyInput().len);
     const tf = s.run_queue.items[0].flushed_ns;
-    try testing.expect(s.checkAcceptanceTimeout(tf + ACCEPT_TIMEOUT_NS + 50 * std.time.ns_per_ms));
+    try testing.expect(!s.checkAcceptanceTimeout(tf + ACCEPT_TIMEOUT_NS + 50 * std.time.ns_per_ms));
+    try testing.expect(s.checkAcceptanceTimeout(tf + ACCEPT_TIMEOUT_FIRST_NS + 50 * std.time.ns_per_ms));
     try testing.expectEqual(.line_rejected, s.completions()[0].result.via);
     s.clearCompletions();
     s.consumePtyInput(s.pendingPtyInput().len); // ^C
 
-    // Latency estimate widened from the wait → next window is ~3× that.
-    try testing.expect(s.last_preexec_latency_ns >= ACCEPT_TIMEOUT_NS);
+    // Rejection widened the estimate from the 5s wait → next window is ~15s.
+    try testing.expect(s.last_preexec_latency_ns >= ACCEPT_TIMEOUT_FIRST_NS);
     var b: [128]u8 = undefined;
     try s.feedPtyOutput(doneOsc(&b, TPID, 130, "/", 0)); // ^C's precmd
     try s.queueRun(2, "b", false);
     s.consumePtyInput(s.pendingPtyInput().len);
     const tf2 = s.run_queue.items[0].flushed_ns;
-    // Past the old 1s floor: must NOT reject (window has grown).
-    try testing.expect(!s.checkAcceptanceTimeout(tf2 + ACCEPT_TIMEOUT_NS + 50 * std.time.ns_per_ms));
+    try testing.expect(!s.checkAcceptanceTimeout(tf2 + ACCEPT_TIMEOUT_FIRST_NS + 50 * std.time.ns_per_ms));
 }
 
 test "acceptance timeout adapts to observed preexec latency" {

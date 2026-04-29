@@ -473,6 +473,20 @@ pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
             .run_done => {
                 const rd = ipc.RunDoneWire.decode(msg.payload) orelse return 1;
                 const ec = rd.exitCode();
+                // line_rejected/prompt_fallback have no exit code; without -j
+                // the only signal is the 125 return — say why.
+                if (ec == null and !json_out) switch (rd.via) {
+                    .line_rejected => errf(
+                        "zmyth: run: shell did not accept the line " ++
+                            "(unclosed quote? or a slow link — retry)\n",
+                        .{},
+                    ),
+                    .prompt_fallback => errf(
+                        "zmyth: run: completed via prompt fallback; exit code unknown\n",
+                        .{},
+                    ),
+                    else => {},
+                };
                 if (json_out) {
                     const via_s = std.enums.tagName(ipc.RunDoneWire.Via, rd.via) orelse "unknown";
                     // Leading \n: ensure JSON is on its own line after PTY output.

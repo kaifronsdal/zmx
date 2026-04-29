@@ -70,6 +70,15 @@ const paste_close = "\x1b[201~\r";
 /// Wrap `s` in `^U \e[200~ ... \e[201~ \r` for typing as one accepted line.
 /// Bracketed paste delivers it verbatim — no history expansion, no `\` line
 /// continuation — and the shell executes on the final CR.
+///
+/// The local hook is *not* delivered this way: the rc-shim sources
+/// `hookBody` directly during shell startup, so BP being enabled is not a
+/// precondition for hooking. BP *is* required for `run`/`write`/`hook`
+/// (which type into a live prompt), and the hook itself forces it on
+/// (`bind 'set enable-bracketed-paste on'` / `zle_bracketed_paste`) as its
+/// last act, so a user rc that disabled it is overridden. If the user
+/// disables it again *after* the hook loads, `run` fails visibly (ec=127,
+/// `[200~cmd[201~: command not found`) — not silently.
 pub fn wrapPaste(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return std.mem.concat(allocator, u8, &.{ paste_open, s, paste_close });
 }

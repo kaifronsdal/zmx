@@ -13,31 +13,35 @@ const Allocator = std.mem.Allocator;
 /// protocol error (or DoS attempt) and yields error.FrameTooLarge.
 const max_frame_len: u32 = 16 * 1024 * 1024;
 
+/// Wire values are frozen: a newer client may connect to an older daemon
+/// (or vice versa) on the same host, so reordering/inserting variants must
+/// not change existing bytes. Add new tags at the end with the next free
+/// value; never reuse a removed one.
 pub const Tag = enum(u8) {
     // ── client → daemon ──────────────────────────────────────────────────
-    attach, //     u16 cols, u16 rows, then KEY=VAL\0… env pairs
-    input, //      raw stdin bytes
-    resize, //     u16 cols, u16 rows
-    run, //        u8 interactive (0/1), then command string
-    send, //       raw bytes for PTY
-    read, //       u8 mode (0=scrollback,1=screen,2=follow), u32 tail_n
-    write_hdr, //   path string → ack 'L' | 'z' | 'p'
-    write_begin, // u8 mode ('z'|'p'), u64 enc-len  (skipped for 'L')
-    write_data, //  chunk (raw for 'L', base64 for 'p'/'z'); empty = EOF
-    info, //       (empty)
-    wait, //       (empty)
-    kill, //       u8 signal (default SIGTERM)
-    detach, //     (empty)
-    hook, //       (empty)
+    attach = 0, //      u16 cols, u16 rows, then KEY=VAL\0… env pairs
+    input = 1, //       raw stdin bytes
+    resize = 2, //      u16 cols, u16 rows
+    run = 3, //         u8 interactive (0/1), then command string
+    send = 4, //        raw bytes for PTY
+    read = 5, //        u8 mode (0=scrollback,1=screen,2=follow), u32 tail_n
+    write_hdr = 6, //   path string → ack 'L' | 'z' | 'p'
+    write_begin = 7, // u8 mode ('z'|'p'), u64 enc-len  (skipped for 'L')
+    write_data = 8, //  chunk (raw for 'L', base64 for 'p'/'z'); empty = EOF
+    info = 9, //        (empty)
+    wait = 10, //       (empty)
+    kill = 11, //       u8 signal (default SIGTERM)
+    detach = 12, //     (empty)
+    hook = 13, //       (empty)
     // ── daemon → client ──────────────────────────────────────────────────
-    output, //     raw PTY bytes
-    state, //      attach replay (chunked)
-    run_done, //   RunDoneWire
-    info_reply, // JSON
-    data, //       read response (chunked)
-    ack, //        optional message string
-    err, //        message string
-    eof, //        (empty)
+    output = 14, //     raw PTY bytes
+    state = 15, //      attach replay (chunked)
+    run_done = 16, //   RunDoneWire
+    info_reply = 17, // JSON
+    data = 18, //       read response (chunked)
+    ack = 19, //        optional message string
+    err = 20, //        message string
+    eof = 21, //        (empty)
     _, // non-exhaustive: unknown tags are returned to the caller, who may skip
 };
 
@@ -67,15 +71,15 @@ pub const RunDoneWire = extern struct {
     dur_ms: u64,
 
     pub const Via = enum(u8) {
-        osc_done,
-        prompt_fallback,
-        pty_eof,
-        line_rejected,
+        osc_done = 0,
+        prompt_fallback = 1,
+        pty_eof = 2,
+        line_rejected = 3,
         /// `run -i`: a nested prompt appeared (via ?2004h or a new-pid `done`).
-        at_prompt,
+        at_prompt = 4,
         /// The layer this run was typed into exited (e.g. ssh dropped) before
         /// the run's own `done` arrived. exit_code is the parent's `done` ec.
-        layer_exited,
+        layer_exited = 5,
         _,
     };
     pub const null_exit: i32 = std.math.minInt(i32);
