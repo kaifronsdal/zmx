@@ -473,7 +473,6 @@ fn runLoop(d: *Daemon) !void {
 /// produces output — so a stalled leader on a quiet session is still
 /// demoted, and a recovered client is re-eligible promptly.
 fn assessClients(d: *Daemon, now: i128) void {
-    var healthy_attached: u32 = 0;
     for (d.clients.items) |*c| {
         if (c.closed) continue;
         const stalled = c.stalled(now);
@@ -487,9 +486,7 @@ fn assessClients(d: *Daemon, now: i128) void {
             log.warn("client {d} stalled; demoting leader", .{c.id});
             d.leader_id = null;
         }
-        if (c.attached and !stalled) healthy_attached += 1;
     }
-    d.session.attached_clients = healthy_attached;
 
     if (d.leader_id == null) {
         for (d.clients.items) |*c| if (c.attached and !c.closed and !c.stalled(now)) {
@@ -497,6 +494,7 @@ fn assessClients(d: *Daemon, now: i128) void {
             break;
         };
     }
+    d.session.has_leader = d.leader_id != null;
 }
 
 /// Non-blocking read: `null` on EAGAIN, `0` on EOF or error, else byte count.
@@ -881,9 +879,14 @@ fn handleInput(d: *Daemon, c: *Client, payload: []const u8) !void {
     // While a PTY-mode write is streaming the body, anything typed would be
     // interleaved into `head -c N`'s input and corrupt the file. Drop it.
     if (d.write) |w| if (w.begun) return;
-    // Leader promotion on real user keystrokes (#135 fix: never drop, just
-    // don't promote on terminal-generated reports).
+    // A real keystroke from a non-leader steals leadership (size follows
+    // the human who's typing). Terminal-generated reports don't.
     if (r.user_input and d.leader_id != c.id) d.promoteLeader(c);
+    // Only the leader's input reaches the PTY: with N attaches, every
+    // terminal answers `\e[6n`, and the app would see N replies. Non-leader
+    // keystrokes already promoted above, so this only drops non-leader
+    // *reports* — exactly the duplicates we want to suppress.
+    if (d.leader_id != c.id) return;
     try d.session.queueSend(payload);
 }
 

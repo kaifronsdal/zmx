@@ -40,15 +40,15 @@ comptime {
 }
 
 /// `Effects.write_pty`: ghostty has computed a response to a terminal query
-/// (DSR `\e[6n`, DECRQM, DA, …) the inner app emitted. With no attach client
-/// the app would otherwise wait on its query timeout, since nothing else can
-/// answer; queue ghostty's response to its stdin. With a client attached, the
-/// real terminal answers via passthrough — stay silent so the app doesn't see
-/// two replies.
+/// (DSR `\e[6n`, DECRQM, DA, …) the inner app emitted. Exactly one party
+/// must answer: when there's a leader, the leader's real terminal does
+/// (via passthrough; non-leader replies are dropped in `handleInput`);
+/// when there's no leader (headless or all stalled), ghostty answers here
+/// so the app doesn't hang on its query timeout.
 fn vtWritePty(h: *VtHandler, data: [:0]const u8) void {
     const stream: *VtStream = @alignCast(@fieldParentPtr("handler", h));
     const sess: *Session = @alignCast(@fieldParentPtr("stream", stream));
-    if (sess.attached_clients > 0) return;
+    if (sess.has_leader) return;
     // OOM: drop the reply; the app will time out as it would have anyway.
     sess.pty_input.appendSlice(sess.gpa, data) catch return;
 }
@@ -198,14 +198,10 @@ pub const Session = struct {
     /// completion. Cleared by `done` (which is authoritative when present).
     osc133_exit: ?i32 = null,
 
-    /// Number of `.attach`ed clients whose write backlog is under the demote
-    /// threshold — i.e., clients whose real terminal can plausibly answer a
-    /// DSR/DA query via passthrough. Recomputed by the daemon before each
-    /// `feedPtyOutput`. When zero, ghostty's shadow terminal answers on the
-    /// app's behalf (`vtWritePty`); when nonzero, ghostty stays silent so the
-    /// app doesn't see two replies. A stalled attach (half-open SSH) doesn't
-    /// count, since it can't relay the query.
-    attached_clients: u32 = 0,
+    /// Set by the daemon while a healthy attached leader exists. Gates
+    /// `vtWritePty`: ghostty answers terminal queries only when no real
+    /// terminal can.
+    has_leader: bool = false,
 
     /// Monotonic count of `preexec` events. Lets the daemon detect "preexec
     /// arrived since I last looked" even when preexec+done land in the same
@@ -1793,18 +1789,16 @@ test "headless: terminal query gets a response" {
     try testing.expect(std.mem.startsWith(u8, s.pendingPtyInput(), "\x1b[?2004;"));
 }
 
-test "headless: query NOT answered when an attach client is present" {
-    // When a real terminal is attached, IT will answer (via passthrough), so
-    // ghostty must stay silent — otherwise the app gets two replies.
+test "ghostty answers queries only when there's no leader" {
     var s = try Session.init(testing.allocator, 24, 80);
     defer s.deinit();
     try hookAndIdle(&s);
 
-    s.attached_clients = 1;
+    s.has_leader = true;
     try s.feedPtyOutput("\x1b[6n");
     try testing.expectEqual(@as(usize, 0), s.pendingPtyInput().len);
 
-    s.attached_clients = 0;
+    s.has_leader = false;
     try s.feedPtyOutput("\x1b[6n");
     try testing.expect(s.pendingPtyInput().len > 0);
 }
