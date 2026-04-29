@@ -4,7 +4,7 @@
 # of its block with `nuke`. PASS/FAIL per check; exit 0 iff all pass.
 #
 # Scenarios marked "# BUG:" expose known zmyth defects — they currently FAIL by
-# design and should flip to PASS once src2/ is fixed. Do not weaken the
+# design and should flip to PASS once src/ is fixed. Do not weaken the
 # assertion to make them pass.
 
 set -uo pipefail

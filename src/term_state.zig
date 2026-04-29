@@ -3,8 +3,8 @@
 //! Three operations on a `vt.Terminal`:
 //!   - serializeForAttach: full state replay (scrollback + screen + modes/cursor)
 //!     so a freshly attached client sees exactly what the daemon's vt sees.
-//!   - dumpScrollback: history (`zmx read`) — primary screen scrollback as text.
-//!   - dumpScreen: snapshot the visible grid (`zmx read -s`) — works on alt-screen.
+//!   - dumpScrollback: history (`zmyth read`) — primary screen scrollback as text.
+//!   - dumpScreen: snapshot the visible grid (`zmyth read -s`) — works on alt-screen.
 //!
 //! Ported from src/util.zig:serializeTerminalState + serializeTerminal.
 
@@ -33,7 +33,7 @@ pub fn serializeForAttach(term: *vt.Terminal, writer: *std.Io.Writer) !void {
     const has_scrollback = !screen_top.eql(active_top);
 
     // Two-phase serialization to preserve scrollback without corrupting
-    // cursor positions. This matters for nested zmx sessions (zmx→SSH→zmx)
+    // cursor positions. This matters for nested zmyth sessions (zmyth→SSH→zmyth)
     // where the outer daemon's ghostty-vt accumulates inner session scrollback.
     //
     // Phase 1: Emit scrollback content (plain text with styles, no terminal extras).
@@ -94,7 +94,7 @@ pub fn serializeForAttach(term: *vt.Terminal, writer: *std.Io.Writer) !void {
 }
 
 /// Dump scrollback + primary screen in the given format. If `tail_n != null`,
-/// only the last N lines. Used by `zmx read`.
+/// only the last N lines. Used by `zmyth read`.
 ///
 /// Always reads the primary screen (where scrollback lives), even if the
 /// terminal is currently on the alt-screen.
@@ -148,7 +148,7 @@ pub fn dumpScrollback(
 }
 
 /// Dump just the visible screen grid (whichever screen is active — including
-/// alt-screen) as plain text. Used by `zmx read -s` to inspect TUIs.
+/// alt-screen) as plain text. Used by `zmyth read -s` to inspect TUIs.
 pub fn dumpScreen(term: *vt.Terminal, writer: *std.Io.Writer) !void {
     const screen = term.screens.active;
     const pages = &screen.pages;
@@ -350,8 +350,8 @@ test "serializeForAttach with scrollback preserves visible content" {
 }
 
 test "serializeForAttach nested roundtrip preserves content" {
-    // Simulates: inner zmx → serialized state → outer ghostty-vt → serialized again → client
-    // This is the exact nested session scenario (zmx → SSH → zmx).
+    // Simulates: inner zmyth → serialized state → outer ghostty-vt → serialized again → client
+    // This is the exact nested session scenario (zmyth → SSH → zmyth).
     const alloc = testing.allocator;
 
     // "Inner" terminal with scrollback + markers

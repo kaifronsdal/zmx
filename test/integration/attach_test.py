@@ -308,7 +308,7 @@ def main():
 
         # B attaches at a DIFFERENT, smaller size and never types. PTY should
         # immediately resize to B's size (B is the freshest attach). Query via
-        # `zmx run` so neither attach client sends .input (which would itself
+        # `zmyth run` so neither attach client sends .input (which would itself
         # re-promote and mask the result).
         B = Attach(env, "ldr", rows=31, cols=119); spawned.append(B)
         B.pump(0.6)

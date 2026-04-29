@@ -57,7 +57,7 @@ SKIP=0
 declare -A CELL   # CELL[shell,engine] = PASS|FAIL|SKIP|<detail>
 
 # Write the engine's init line for $shell into the rc file zmyth's shim will
-# source: ~/.bashrc, ~/.zshrc, ~/.config/fish/config.fish (see src2/spawn.zig).
+# source: ~/.bashrc, ~/.zshrc, ~/.config/fish/config.fish (see src/spawn.zig).
 write_rc() {
   local home=$1 shell=$2 engine=$3 init=""
   case "$engine" in

@@ -1,7 +1,7 @@
 .{
-    .name = .zmx,
-    .version = "0.5.0",
-    .fingerprint = 0x28aad87005052b4e, // Changing this has security and trust implications.
+    .name = .zmyth,
+    .version = "0.1.0",
+    .fingerprint = 0xef1626ea946eb562,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .ghostty = .{
@@ -13,5 +13,6 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "LICENSE",
     },
 }

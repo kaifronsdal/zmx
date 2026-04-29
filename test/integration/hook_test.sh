@@ -45,8 +45,8 @@ chk "hook reports installed" 'echo "$out" | grep -q "installed.*hook.bash"' '$ou
 
 chk "hook file written" '[ -f "$HOME/.config/zmyth/hook.bash" ]' '$(ls -la $HOME/.config/zmyth 2>&1)'
 chk "hook file matches asset byte-for-byte" \
-    'cmp -s "$HOME/.config/zmyth/hook.bash" src2/assets/hook.bash' \
-    '$(diff $HOME/.config/zmyth/hook.bash src2/assets/hook.bash 2>&1 | head -5)'
+    'cmp -s "$HOME/.config/zmyth/hook.bash" src/assets/hook.bash' \
+    '$(diff $HOME/.config/zmyth/hook.bash src/assets/hook.bash 2>&1 | head -5)'
 chk ".bashrc has source line" 'grep -q "zmyth/hook.bash" "$HOME/.bashrc"' '$(cat $HOME/.bashrc)'
 chk ".bashrc line count == 1" '[ "$(grep -c zmyth $HOME/.bashrc)" -eq 1 ]' '$(cat $HOME/.bashrc)'
 
@@ -91,7 +91,7 @@ if command -v zsh >/dev/null; then
   out=$("$ZMYTH" hook "$S" 2>&1); rc=$?
   chk "zsh: hook exits 0" '[ $rc -eq 0 ]' '$rc: $out'
   chk "zsh: hook file written" '[ -f "$HOME/.config/zmyth/hook.zsh" ]' ''
-  chk "zsh: matches asset" 'cmp -s "$HOME/.config/zmyth/hook.zsh" src2/assets/hook.zsh' ''
+  chk "zsh: matches asset" 'cmp -s "$HOME/.config/zmyth/hook.zsh" src/assets/hook.zsh' ''
   chk "zsh: .zshrc has source line" 'grep -q "zmyth/hook.zsh" "$HOME/.zshrc"' '$(cat $HOME/.zshrc)'
   nuke "$S"
 fi
@@ -107,7 +107,7 @@ if command -v fish >/dev/null; then
   out=$("$ZMYTH" hook "$S" 2>&1); rc=$?
   chk "fish: hook exits 0" '[ $rc -eq 0 ]' '$rc: $out'
   chk "fish: hook file written" '[ -f "$HOME/.config/zmyth/hook.fish" ]' ''
-  chk "fish: matches asset" 'cmp -s "$HOME/.config/zmyth/hook.fish" src2/assets/hook.fish' ''
+  chk "fish: matches asset" 'cmp -s "$HOME/.config/zmyth/hook.fish" src/assets/hook.fish' ''
   chk "fish: conf.d/zmyth.fish written" '[ -f "$HOME/.config/fish/conf.d/zmyth.fish" ]' ''
   nuke "$S"
 fi
@@ -172,9 +172,9 @@ chk "M4: re-run does not duplicate rc line" \
 nuke "$S"
 
 # M5: hook is inert under TERM=dumb
-out=$(env TERM=dumb bash --norc -c '. src2/assets/hook.bash; echo "v=$__ZMYTH_HOOK_V"' 2>&1)
+out=$(env TERM=dumb bash --norc -c '. src/assets/hook.bash; echo "v=$__ZMYTH_HOOK_V"' 2>&1)
 chk "M5: TERM=dumb → hook inert (var unset)" 'echo "$out" | grep -q "^v=$"' '$out'
-out=$(env TERM=xterm-256color bash --norc -c '. src2/assets/hook.bash; echo "v=$__ZMYTH_HOOK_V"' 2>&1)
+out=$(env TERM=xterm-256color bash --norc -c '. src/assets/hook.bash; echo "v=$__ZMYTH_HOOK_V"' 2>&1)
 chk "M5: TERM=xterm → hook active" 'echo "$out" | grep -qE "^v=[1-9][0-9]*$"' '$out'
 
 # ─── case 5: error — not at a shell prompt (python REPL) ──────────────────

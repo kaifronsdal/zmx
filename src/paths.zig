@@ -1,5 +1,5 @@
 //! Filesystem layout: where sockets and persistent state live, plus
-//! session-name validation and a tiny glob matcher for `zmx ls foo*`.
+//! session-name validation and a tiny glob matcher for `zmyth ls foo*`.
 
 const std = @import("std");
 const posix = std.posix;

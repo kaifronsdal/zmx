@@ -105,7 +105,7 @@ const Completion = struct {
     result: RunCompletion,
 };
 
-/// One pending `zmx run` request.
+/// One pending `zmyth run` request.
 const RunRequest = struct {
     /// Owned by Session.
     cmd: []u8,
@@ -344,7 +344,7 @@ pub const Session = struct {
         try self.tryTypeNext();
     }
 
-    /// Queue a `zmx run` request. If the top layer is idle, types it
+    /// Queue a `zmyth run` request. If the top layer is idle, types it
     /// immediately; otherwise it waits for the next done/prompt.
     pub fn queueRun(self: *Session, client_id: u32, cmd: []const u8, interactive: bool) !void {
         const owned = try self.gpa.dupe(u8, cmd);
@@ -613,7 +613,7 @@ pub const Session = struct {
     /// shell is wedged and accepting more would only OOM the daemon.
     pub const pty_input_cap = 1 * 1024 * 1024;
 
-    /// Queue raw bytes to PTY (zmx send). No waiting, no wrapping.
+    /// Queue raw bytes to PTY (zmyth send). No waiting, no wrapping.
     pub fn queueSend(self: *Session, bytes: []const u8) !void {
         if (self.pty_input.items.len + bytes.len > pty_input_cap)
             return error.PtyInputOverflow;

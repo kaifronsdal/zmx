@@ -1028,7 +1028,7 @@ const setenv = paths.setenv;
 const unsetenv = paths.unsetenv;
 
 test "resolveGlobs dedupe + literal passthrough" {
-    const tmp = "/tmp/zmx-client-test-globs";
+    const tmp = "/tmp/zmyth-client-test-globs";
     std.fs.deleteTreeAbsolute(tmp) catch {};
     defer std.fs.deleteTreeAbsolute(tmp) catch {};
     _ = setenv("ZMYTH_DIR", tmp, 1);
