@@ -268,25 +268,7 @@ chk "20b write text round-trip" "[ \"\$(cat '$dst' 2>/dev/null)\" = 'hello write
 rm -f "$dst"
 nuke t20
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 21. write: bash/zsh/fish × {tiny, 2MB} binary round-trip.
-#     Tiny exercises the line-editor over-read race (body must wait for
-#     preexec); 2MB exercises backpressure (was BrokenPipe before).
-# ─────────────────────────────────────────────────────────────────────────────
-src=$(mktemp); dst=$(mktemp)
-for sh in bash zsh fish; do
-  command -v "$sh" >/dev/null || { echo "SKIP: 21 $sh (not installed)"; continue; }
-  for sz in 3 2097152; do
-    head -c "$sz" /dev/urandom > "$src"; rm -f "$dst"
-    SHELL=$(command -v "$sh") "$ZMX" run "t21$sh" -- true >/dev/null
-    timeout 30 "$ZMX" write "t21$sh" "$dst" < "$src"
-    "$ZMX" run "t21$sh" -- true >/dev/null
-    cmp -s "$src" "$dst"
-    chk "21  $sh write ${sz}B round-trip" "[ $? -eq 0 ]"
-    nuke "t21$sh"
-  done
-done
-rm -f "$src" "$dst"
+# (write round-trip matrix lives in write_test.sh)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 22. wait: blocks on the daemon (no polling) until run completes.

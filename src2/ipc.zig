@@ -185,6 +185,13 @@ pub const Framer = struct {
         if (self.write_pos == self.write_buf.items.len) {
             self.write_buf.clearRetainingCapacity();
             self.write_pos = 0;
+        } else if (self.write_pos > self.write_buf.items.len / 2) {
+            // Compact so a slow-but-nonzero reader doesn't grow capacity
+            // unbounded while pendingWrite() stays small.
+            const rem = self.write_buf.items.len - self.write_pos;
+            std.mem.copyForwards(u8, self.write_buf.items[0..rem], self.write_buf.items[self.write_pos..]);
+            self.write_buf.shrinkRetainingCapacity(rem);
+            self.write_pos = 0;
         }
     }
 };

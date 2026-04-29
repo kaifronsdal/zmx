@@ -26,11 +26,13 @@ const ACCEPT_TIMEOUT_NS: i128 = 1000 * std.time.ns_per_ms;
 /// `ReadonlyStream` is not re-exported from lib_vt; derive it.
 const VtStream = @TypeOf(@as(*vt.Terminal, undefined).vtStream());
 const VtHandler = VtStream.Handler;
-// `device_attributes.Attributes` isn't re-exported from lib_vt; derive it from
-// the callback's return type (`?*const fn(*Handler) Attributes`).
-const VtAttrs = @typeInfo(@typeInfo(
-    @typeInfo(@FieldType(VtHandler.Effects, "device_attributes")).optional.child,
-).pointer.child).@"fn".return_type.?;
+/// Return type of `Effects.<field>`'s callback (the types aren't re-exported
+/// from lib_vt, so derive them from `?*const fn(*Handler) T`).
+fn EffectRet(comptime field: []const u8) type {
+    return @typeInfo(@typeInfo(
+        @typeInfo(@FieldType(VtHandler.Effects, field)).optional.child,
+    ).pointer.child).@"fn".return_type.?;
+}
 
 // The handler→stream→session `@fieldParentPtr` chain below is sound only
 // while ghostty's `Stream` holds its handler by value. Guard at comptime so
@@ -56,8 +58,39 @@ fn vtWritePty(h: *VtHandler, data: [:0]const u8) void {
 /// `Effects.device_attributes`: what to report for DA1/2/3. Default = VT220
 /// with ANSI colour — conservative enough that apps won't try features the
 /// eventual real terminal might lack.
-fn vtDeviceAttrs(_: *VtHandler) VtAttrs {
+fn vtDeviceAttrs(_: *VtHandler) EffectRet("device_attributes") {
     return .{};
+}
+
+/// `Effects.size` (XTWINOPS 14/16/18 t): cell + pixel geometry. Rows/cols
+/// from the shadow terminal; cell pixel size is faked (8×16) since there's
+/// no real font headlessly. Prevents image tools (chafa, timg) from sitting
+/// on a query timeout.
+fn vtSize(h: *VtHandler) EffectRet("size") {
+    const stream: *VtStream = @alignCast(@fieldParentPtr("handler", h));
+    const sess: *Session = @alignCast(@fieldParentPtr("stream", stream));
+    if (sess.has_leader) return null;
+    return .{
+        .rows = @intCast(sess.term.screens.active.pages.rows),
+        .columns = @intCast(sess.term.screens.active.pages.cols),
+        .cell_width = 8,
+        .cell_height = 16,
+    };
+}
+
+/// `Effects.color_scheme` (DSR ?996 n): light/dark. Report dark — the
+/// overwhelmingly common terminal default. nvim 0.10+ probes this for
+/// `&background` autodetect.
+fn vtColorScheme(h: *VtHandler) EffectRet("color_scheme") {
+    const stream: *VtStream = @alignCast(@fieldParentPtr("handler", h));
+    const sess: *Session = @alignCast(@fieldParentPtr("stream", stream));
+    if (sess.has_leader) return null;
+    return .dark;
+}
+
+/// `Effects.xtversion`: don't leak "libghostty".
+fn vtVersion(_: *VtHandler) EffectRet("xtversion") {
+    return "zmyth";
 }
 
 const RunCompletion = struct {
@@ -278,8 +311,16 @@ pub const Session = struct {
         // per-field defaults so naming every callback there is noisier than
         // two stores here.
         self.stream.handler.terminal = &self.term;
-        self.stream.handler.effects.write_pty = &vtWritePty;
-        self.stream.handler.effects.device_attributes = &vtDeviceAttrs;
+        self.stream.handler.effects = .{
+            .write_pty = &vtWritePty,
+            .device_attributes = &vtDeviceAttrs,
+            .size = &vtSize,
+            .color_scheme = &vtColorScheme,
+            .xtversion = &vtVersion,
+            .bell = null,
+            .enquiry = null,
+            .title_changed = null,
+        };
         self.stream.nextSlice(bytes);
 
         self.events.clearRetainingCapacity();
@@ -1801,6 +1842,26 @@ test "ghostty answers queries only when there's no leader" {
     s.has_leader = false;
     try s.feedPtyOutput("\x1b[6n");
     try testing.expect(s.pendingPtyInput().len > 0);
+}
+
+test "headless: XTWINOPS, color-scheme, XTVERSION are answered" {
+    var s = try Session.init(testing.allocator, 24, 80);
+    defer s.deinit();
+    try hookAndIdle(&s);
+
+    // CSI 18 t → CSI 8;rows;cols t
+    try s.feedPtyOutput("\x1b[18t");
+    try testing.expect(std.mem.indexOf(u8, s.pendingPtyInput(), "\x1b[8;24;80t") != null);
+    s.consumePtyInput(s.pendingPtyInput().len);
+
+    // DSR ?996 n (color scheme) → CSI ? 997 ; 1|2 n
+    try s.feedPtyOutput("\x1b[?996n");
+    try testing.expect(std.mem.indexOf(u8, s.pendingPtyInput(), "\x1b[?997;") != null);
+    s.consumePtyInput(s.pendingPtyInput().len);
+
+    // XTVERSION → DCS > | zmyth ST
+    try s.feedPtyOutput("\x1b[>0q");
+    try testing.expect(std.mem.indexOf(u8, s.pendingPtyInput(), "zmyth") != null);
 }
 
 test "OSC 7 updates lastCwd in unhooked session" {
