@@ -247,6 +247,133 @@ pub fn posixQuote(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+// ───────────────────── spawn recipe ─────────────────────
+//
+// `spawnSpec()` is the pure half of spawning a hooked shell: it returns
+// *what to write and exec*, not the syscalls. The caller writes `files`
+// under `rc_dir`, merges `env_set` over their inherited env (after
+// stripping `env_strip`), and execs `argv`. Works with fork/posix_spawn/
+// remote-exec equally — and `lib/` stays fd-free.
+
+pub const SpawnSpec = struct {
+    /// argv[0] is `opts.shell_path`. All slices borrow from `arena` or
+    /// `opts`; keep both alive until after exec.
+    argv: []const []const u8,
+    /// Env vars to set/override after stripping `env_strip`.
+    env_set: []const KV,
+    /// Keys to remove from the inherited env before applying `env_set`
+    /// (zsh: ZDOTDIR + the ZDOTDIR-restore helpers, so a nested zsh
+    /// inside the session reads the user's dotdir, not our shim).
+    env_strip: []const []const u8,
+    /// Files to write under `rc_dir` (paths relative to it) before exec.
+    files: []const File,
+
+    pub const KV = struct { key: []const u8, val: []const u8 };
+    pub const File = struct { name: []const u8, content: []const u8 };
+};
+
+pub const SpawnOpts = struct {
+    /// Absolute path to the shell binary.
+    shell_path: []const u8,
+    /// Directory the caller will write `files` into. Appears in argv
+    /// (bash `--rcfile`) and env (zsh `ZDOTDIR=`), so the caller must
+    /// create it and pass the real path.
+    rc_dir: []const u8,
+    /// Appended after the user's rc is sourced. Pass `hookBody(shell)`
+    /// for OSC-2718, or your own integration snippet.
+    body: []const u8,
+    /// Current value of `$ZDOTDIR` (zsh only). null = unset.
+    orig_zdotdir: ?[]const u8 = null,
+};
+
+/// Per-shell recipe for launching an interactive shell with `opts.body`
+/// loaded *after* the user's rc, without breaking the user's config.
+///
+/// bash: `--rcfile` to a shim that sources `~/.bashrc` then `body`.
+///
+/// zsh: no `--rcfile` exists. Hijack `ZDOTDIR` to point at `rc_dir`; but
+/// the user's `.zshenv` runs first and may itself set `ZDOTDIR`, so the
+/// `.zshenv` shim restores the original, sources the user's, captures
+/// whatever ZDOTDIR that left, and re-hijacks; the `.zshrc` shim then
+/// restores the captured value before sourcing the user's `.zshrc`.
+///
+/// fish: `-C <body>` runs before `config.fish`; since the body only
+/// registers event handlers, order doesn't matter and no file is needed.
+///
+/// `.unknown`: plain `-i`, no body — degraded mode.
+///
+/// All allocations go into `arena`; caller frees the arena.
+pub fn spawnSpec(arena: Allocator, shell: Shell, opts: SpawnOpts) !SpawnSpec {
+    const dupe = std.mem.concat;
+    return switch (shell) {
+        .bash => .{
+            .argv = try dupe(arena, []const u8, &.{&.{
+                opts.shell_path,
+                "--rcfile",
+                try std.fs.path.join(arena, &.{ opts.rc_dir, "bashrc" }),
+                "-i",
+            }}),
+            .env_set = &.{},
+            .env_strip = &.{},
+            .files = try dupe(arena, SpawnSpec.File, &.{&.{.{
+                .name = "bashrc",
+                .content = try dupe(arena, u8, &.{
+                    "[ -f ~/.bashrc ] && . ~/.bashrc\n",
+                    opts.body,
+                }),
+            }}}),
+        },
+        .zsh => blk: {
+            // rc_dir is user-influenced; quote it so a `'` in the path
+            // can't break out of the assignment.
+            const rc_q = try posixQuote(arena, opts.rc_dir);
+            break :blk .{
+                .argv = try dupe(arena, []const u8, &.{&.{ opts.shell_path, "-i" }}),
+                .env_set = try dupe(arena, SpawnSpec.KV, &.{&.{
+                    .{ .key = "_ZMYTH_ORIG_ZDOTDIR", .val = opts.orig_zdotdir orelse "" },
+                    .{ .key = "ZDOTDIR", .val = opts.rc_dir },
+                }}),
+                .env_strip = &.{ "ZDOTDIR", "_ZMYTH_ORIG_ZDOTDIR" },
+                .files = try dupe(arena, SpawnSpec.File, &.{&.{
+                    .{
+                        .name = ".zshenv",
+                        .content = try std.fmt.allocPrint(
+                            arena,
+                            "if [ -n \"$_ZMYTH_ORIG_ZDOTDIR\" ]; then export ZDOTDIR=\"$_ZMYTH_ORIG_ZDOTDIR\"; else unset ZDOTDIR; fi\n" ++
+                                "[ -f \"${{ZDOTDIR:-$HOME}}/.zshenv\" ] && . \"${{ZDOTDIR:-$HOME}}/.zshenv\"\n" ++
+                                "export _ZMYTH_USER_ZDOTDIR=\"${{ZDOTDIR-__unset__}}\"\n" ++
+                                "export ZDOTDIR={s}\n",
+                            .{rc_q},
+                        ),
+                    },
+                    .{
+                        .name = ".zshrc",
+                        .content = try dupe(arena, u8, &.{
+                            "if [ \"$_ZMYTH_USER_ZDOTDIR\" = __unset__ ]; then unset ZDOTDIR; " ++
+                                "else export ZDOTDIR=\"$_ZMYTH_USER_ZDOTDIR\"; fi\n" ++
+                                "unset _ZMYTH_USER_ZDOTDIR _ZMYTH_ORIG_ZDOTDIR\n" ++
+                                "[ -f \"${ZDOTDIR:-$HOME}/.zshrc\" ] && . \"${ZDOTDIR:-$HOME}/.zshrc\"\n",
+                            opts.body,
+                        }),
+                    },
+                }}),
+            };
+        },
+        .fish => .{
+            .argv = try dupe(arena, []const u8, &.{&.{ opts.shell_path, "-i", "-C", opts.body }}),
+            .env_set = &.{},
+            .env_strip = &.{},
+            .files = &.{},
+        },
+        .unknown => .{
+            .argv = try dupe(arena, []const u8, &.{&.{ opts.shell_path, "-i" }}),
+            .env_set = &.{},
+            .env_strip = &.{},
+            .files = &.{},
+        },
+    };
+}
+
 // ───────────────────────────── tests ─────────────────────────────
 
 const testing = std.testing;
@@ -320,6 +447,96 @@ test "posixQuote" {
     const q3 = try posixQuote(testing.allocator, "");
     defer testing.allocator.free(q3);
     try testing.expectEqualStrings("''", q3);
+}
+
+test "spawnSpec: bash → --rcfile shim sourcing ~/.bashrc then body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const spec = try spawnSpec(arena.allocator(), .bash, .{
+        .shell_path = "/bin/bash",
+        .rc_dir = "/tmp/rc",
+        .body = "BODY\n",
+    });
+    try testing.expectEqual(@as(usize, 4), spec.argv.len);
+    try testing.expectEqualStrings("/bin/bash", spec.argv[0]);
+    try testing.expectEqualStrings("--rcfile", spec.argv[1]);
+    try testing.expectEqualStrings("/tmp/rc/bashrc", spec.argv[2]);
+    try testing.expectEqualStrings("-i", spec.argv[3]);
+    try testing.expectEqual(@as(usize, 0), spec.env_set.len);
+    try testing.expectEqual(@as(usize, 0), spec.env_strip.len);
+    try testing.expectEqual(@as(usize, 1), spec.files.len);
+    try testing.expectEqualStrings("bashrc", spec.files[0].name);
+    try testing.expect(std.mem.startsWith(u8, spec.files[0].content, "[ -f ~/.bashrc ] && . ~/.bashrc\n"));
+    try testing.expect(std.mem.endsWith(u8, spec.files[0].content, "BODY\n"));
+}
+
+test "spawnSpec: zsh → ZDOTDIR hijack with two-file restore dance" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const spec = try spawnSpec(arena.allocator(), .zsh, .{
+        .shell_path = "/usr/bin/zsh",
+        .rc_dir = "/run/x",
+        .body = "BODY\n",
+        .orig_zdotdir = "/home/u/.zsh",
+    });
+    try testing.expectEqualStrings("-i", spec.argv[1]);
+    // env: ZDOTDIR points at rc_dir; the original is stashed.
+    try testing.expectEqual(@as(usize, 2), spec.env_set.len);
+    try testing.expectEqualStrings("_ZMYTH_ORIG_ZDOTDIR", spec.env_set[0].key);
+    try testing.expectEqualStrings("/home/u/.zsh", spec.env_set[0].val);
+    try testing.expectEqualStrings("ZDOTDIR", spec.env_set[1].key);
+    try testing.expectEqualStrings("/run/x", spec.env_set[1].val);
+    // env_strip: both keys, so a nested zsh inside the session inherits
+    // neither our hijack nor the helper.
+    try testing.expectEqual(@as(usize, 2), spec.env_strip.len);
+    // Two shim files; .zshenv re-hijacks, .zshrc restores then loads body.
+    try testing.expectEqual(@as(usize, 2), spec.files.len);
+    try testing.expectEqualStrings(".zshenv", spec.files[0].name);
+    try testing.expect(std.mem.indexOf(u8, spec.files[0].content, "export ZDOTDIR='/run/x'\n") != null);
+    try testing.expectEqualStrings(".zshrc", spec.files[1].name);
+    try testing.expect(std.mem.indexOf(u8, spec.files[1].content, "${ZDOTDIR:-$HOME}/.zshrc") != null);
+    try testing.expect(std.mem.endsWith(u8, spec.files[1].content, "BODY\n"));
+}
+
+test "spawnSpec: zsh quotes rc_dir containing single-quote" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const spec = try spawnSpec(arena.allocator(), .zsh, .{
+        .shell_path = "zsh",
+        .rc_dir = "/tmp/a'b",
+        .body = "",
+    });
+    // The .zshenv shim assigns ZDOTDIR=<rc_dir>; an unquoted `'` would
+    // break the assignment.
+    try testing.expect(std.mem.indexOf(u8, spec.files[0].content, "'/tmp/a'\\''b'") != null);
+}
+
+test "spawnSpec: fish → -C body, no files" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const spec = try spawnSpec(arena.allocator(), .fish, .{
+        .shell_path = "/usr/bin/fish",
+        .rc_dir = "/unused",
+        .body = "function __x; end\n",
+    });
+    try testing.expectEqual(@as(usize, 4), spec.argv.len);
+    try testing.expectEqualStrings("-C", spec.argv[2]);
+    try testing.expectEqualStrings("function __x; end\n", spec.argv[3]);
+    try testing.expectEqual(@as(usize, 0), spec.files.len);
+    try testing.expectEqual(@as(usize, 0), spec.env_set.len);
+}
+
+test "spawnSpec: unknown → plain -i, degraded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const spec = try spawnSpec(arena.allocator(), .unknown, .{
+        .shell_path = "/bin/sh",
+        .rc_dir = "/unused",
+        .body = "ignored",
+    });
+    try testing.expectEqual(@as(usize, 2), spec.argv.len);
+    try testing.expectEqualStrings("-i", spec.argv[1]);
+    try testing.expectEqual(@as(usize, 0), spec.files.len);
 }
 
 test "hook_version constant matches __ZMYTH_HOOK_V in every asset" {

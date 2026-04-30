@@ -13,13 +13,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
-/// Set or clear O_NONBLOCK on `fd`. Works on any fd (sockets, PTYs, pipes).
-pub fn setNonBlock(fd: posix.fd_t, on: bool) !void {
-    const flags: usize = try posix.fcntl(fd, posix.F.GETFL, 0);
-    const nb: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
-    _ = try posix.fcntl(fd, posix.F.SETFL, if (on) flags | nb else flags & ~nb);
-}
-
 /// Sequential (non-positional) writeAll. Zig 0.15's `File.writer(buf)`
 /// defaults to *positional* mode (`File.Writer.Mode.positional`): it tracks
 /// its own `pos` and flushes via `pwritev`. That's correct when one writer

@@ -10,7 +10,7 @@ const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
-const pty = @import("posix/pty.zig");
+const pty = lib.posix;
 const lib = @import("zmyth");
 const hook = lib.hook;
 const Shell = lib.Shell;
@@ -50,9 +50,9 @@ pub const Spawned = struct {
 };
 
 /// Spawn the session shell into PTY `p`. If `initial_cmd` is given, exec it
-/// directly (degraded mode: no rc shim, no hooks). Otherwise detect the shell
-/// from `$SHELL`, write an rc shim under `rc_dir` that sources the user's rc
-/// then `hook.body(shell)`, and exec the shell interactively.
+/// directly (degraded mode: no rc shim, no hooks). Otherwise detect the
+/// shell from `$SHELL`, materialise `hook.spawnSpec` (write rc shims, merge
+/// env), and forkExec.
 pub fn spawnShell(
     allocator: Allocator,
     p: *pty.Pty,
@@ -65,27 +65,28 @@ pub fn spawnShell(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Detect shell up front so the env-strip loop knows whether to take
-    // ZDOTDIR (only the zsh arm overrides it; bash/fish should inherit so
-    // a `zsh` launched later inside the session reads the right dotdir).
     const shell_path = posix.getenv("SHELL") orelse "/bin/sh";
     const shell: Shell = if (initial_cmd != null) .unknown else Shell.parse(std.fs.path.basename(shell_path));
+    if (shell == .unknown and initial_cmd == null)
+        log.warn("unknown shell '{s}'; spawning without hook", .{shell_path});
 
-    // Base env: inherit parent + ZMYTH_SESSION + TERM (if unset) + indirected
-    // refresh keys pointing at <env_dir>/<KEY>.
+    const spec = try hook.spawnSpec(arena, shell, .{
+        .shell_path = shell_path,
+        .rc_dir = rc_dir,
+        .body = if (shell == .unknown) "" else hook.body(shell),
+        .orig_zdotdir = posix.getenv("ZDOTDIR"),
+    });
+
+    // ── env: inherit parent, strip per-spec + zmyth + symlink keys, then
+    //    add ZMYTH_SESSION/TERM/symlinks/spec.env_set ──────────────────
     var env: std.ArrayList([*:0]const u8) = .empty;
     {
         var ptr = std.c.environ;
-        while (ptr[0]) |e| : (ptr += 1) {
+        outer: while (ptr[0]) |e| : (ptr += 1) {
             const s = std.mem.span(e);
             if (envKeyIs(s, "ZMYTH_SESSION")) continue;
-            if (shell == .zsh and (envKeyIs(s, "_ZMYTH_ORIG_ZDOTDIR") or
-                envKeyIs(s, "ZDOTDIR"))) continue;
-            var skip = false;
-            for (refresh_env_keys) |k| if (envKeyIs(s, k)) {
-                skip = true;
-            };
-            if (skip) continue;
+            for (spec.env_strip) |k| if (envKeyIs(s, k)) continue :outer;
+            for (refresh_env_keys) |k| if (envKeyIs(s, k)) continue :outer;
             try env.append(arena, e);
         }
     }
@@ -105,79 +106,32 @@ pub fn spawnShell(
         try posix.symlink(val, link);
         try env.append(arena, try std.fmt.allocPrintSentinel(arena, "{s}={s}", .{ k, link }, 0));
     }
+    for (spec.env_set) |kv| {
+        try env.append(arena, try std.fmt.allocPrintSentinel(arena, "{s}={s}", .{ kv.key, kv.val }, 0));
+    }
 
     // Explicit initial command: degraded mode, no rc shim, no hooks.
     if (initial_cmd) |cmd| {
         return .{ .pid = try pty.forkExec(p, cmd, env.items), .shell = .unknown };
     }
 
-    std.fs.makeDirAbsolute(rc_dir) catch |e| switch (e) {
-        error.PathAlreadyExists => {},
-        else => return e,
-    };
-
-    // The rc-shim sources the user's rc, then the hook script itself —
-    // loaded *during* rc, not typed afterward, so there is no preexec/done
-    // for the daemon to swallow. Layer 0 announces via its first `done`
-    // (the hook's first precmd) exactly like a file-installed nested layer.
-    var argv: std.ArrayList([]const u8) = .empty;
-    switch (shell) {
-        .bash => {
-            // bash <4 lacks bracketed-paste; the hook self-guards on
-            // BASH_VERSINFO so it's a no-op there → session is degraded
-            // (?2004h-only) and `run` falls back to .prompt_fallback.
-            const rc = try std.fmt.allocPrint(arena, "{s}/bashrc", .{rc_dir});
-            try writeFile(rc, try std.mem.concat(arena, u8, &.{
-                "[ -f ~/.bashrc ] && . ~/.bashrc\n",
-                hook.body(.bash),
-            }));
-            try argv.appendSlice(arena, &.{ shell_path, "--rcfile", rc, "-i" });
-        },
-        .zsh => {
-            // We hijack ZDOTDIR to point at our shim. The shim must (a) let
-            // the user's .zshenv run with the *original* ZDOTDIR visible,
-            // (b) capture whatever ZDOTDIR the user's .zshenv left behind,
-            // (c) re-hijack so zsh reads OUR .zshrc next, then (d) restore
-            // the captured value before sourcing the user's .zshrc.
-            const orig_zdot = posix.getenv("ZDOTDIR") orelse "";
-            const zenv = try std.fmt.allocPrint(arena, "{s}/.zshenv", .{rc_dir});
-            // rc_dir derives from user-supplied $ZMYTH_DIR; quote it so a
-            // `'` in the path can't break out of the assignment.
-            const rc_dir_q = try hook.posixQuote(arena, rc_dir);
-            try writeFile(zenv, try std.fmt.allocPrint(
-                arena,
-                "if [ -n \"$_ZMYTH_ORIG_ZDOTDIR\" ]; then export ZDOTDIR=\"$_ZMYTH_ORIG_ZDOTDIR\"; else unset ZDOTDIR; fi\n" ++
-                    "[ -f \"${{ZDOTDIR:-$HOME}}/.zshenv\" ] && . \"${{ZDOTDIR:-$HOME}}/.zshenv\"\n" ++
-                    "export _ZMYTH_USER_ZDOTDIR=\"${{ZDOTDIR-__unset__}}\"\n" ++
-                    "export ZDOTDIR={s}\n",
-                .{rc_dir_q},
-            ));
-            const rc = try std.fmt.allocPrint(arena, "{s}/.zshrc", .{rc_dir});
-            try writeFile(rc, try std.mem.concat(arena, u8, &.{
-                "if [ \"$_ZMYTH_USER_ZDOTDIR\" = __unset__ ]; then unset ZDOTDIR; " ++
-                    "else export ZDOTDIR=\"$_ZMYTH_USER_ZDOTDIR\"; fi\n" ++
-                    "unset _ZMYTH_USER_ZDOTDIR _ZMYTH_ORIG_ZDOTDIR\n" ++
-                    "[ -f \"${ZDOTDIR:-$HOME}/.zshrc\" ] && . \"${ZDOTDIR:-$HOME}/.zshrc\"\n",
-                hook.body(.zsh),
-            }));
-            try env.append(arena, try std.fmt.allocPrintSentinel(arena, "_ZMYTH_ORIG_ZDOTDIR={s}", .{orig_zdot}, 0));
-            try env.append(arena, try std.fmt.allocPrintSentinel(arena, "ZDOTDIR={s}", .{rc_dir}, 0));
-            try argv.appendSlice(arena, &.{ shell_path, "-i" });
-        },
-        .fish => {
-            // -C runs *before* config.fish, but the hook only registers
-            // event handlers (--on-event) — order vs user config doesn't
-            // matter. Pass the body as the -C argument directly so rc_dir
-            // (which may contain spaces/quotes) never appears in fish source.
-            try argv.appendSlice(arena, &.{ shell_path, "-i", "-C", hook.body(.fish) });
-        },
-        .unknown => {
-            log.warn("unknown shell '{s}'; spawning without hook", .{shell_path});
-            try argv.appendSlice(arena, &.{ shell_path, "-i" });
-        },
+    // ── materialise rc shims ────────────────────────────────────────────
+    if (spec.files.len > 0) {
+        std.fs.makeDirAbsolute(rc_dir) catch |e| switch (e) {
+            error.PathAlreadyExists => {},
+            else => return e,
+        };
+        for (spec.files) |f| {
+            const path = try std.fs.path.join(arena, &.{ rc_dir, f.name });
+            try std.fs.cwd().writeFile(.{
+                .sub_path = path,
+                .data = f.content,
+                .flags = .{ .mode = 0o600 },
+            });
+        }
     }
 
-    return .{ .pid = try pty.forkExec(p, argv.items, env.items), .shell = shell };
+    return .{ .pid = try pty.forkExec(p, spec.argv, env.items), .shell = shell };
 }
 
 /// Parse a `KEY=VAL\0KEY=VAL\0...` blob and, for each key in
@@ -209,14 +163,6 @@ fn envKeyIs(entry: []const u8, key: []const u8) bool {
     return entry.len > key.len and
         entry[key.len] == '=' and
         std.mem.eql(u8, entry[0..key.len], key);
-}
-
-fn writeFile(path: []const u8, contents: []const u8) !void {
-    try std.fs.cwd().writeFile(.{
-        .sub_path = path,
-        .data = contents,
-        .flags = .{ .mode = 0o600 },
-    });
 }
 
 const testing = std.testing;

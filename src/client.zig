@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 
 const ipc = @import("ipc.zig");
 const paths = @import("posix/paths.zig");
-const pty = @import("posix/pty.zig");
+const pty = lib.posix;
 const compat = @import("posix/compat.zig");
 const daemon = @import("daemon.zig");
 const spawn = @import("spawn.zig");
@@ -178,7 +178,7 @@ fn probeAll(allocator: Allocator, names: []const []const u8) ![]Probe {
         if (re & (posix.POLL.ERR | posix.POLL.HUP) != 0) continue;
         posix.getsockoptError(fd) catch continue;
         // Flip back to blocking for the request/reply.
-        compat.setNonBlock(fd, false) catch continue;
+        lib.posix.setNonBlock(fd, false) catch continue;
         // Bound the wait so a wedged daemon can't hang `ls`.
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&recv_to)) catch {};
 
@@ -336,7 +336,7 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
     };
 
     // Make socket nonblocking for the Framer-driven pump.
-    try compat.setNonBlock(sock, true);
+    try lib.posix.setNonBlock(sock, true);
 
     var framer = ipc.Framer.init(allocator);
     defer framer.deinit();

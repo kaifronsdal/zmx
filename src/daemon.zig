@@ -11,10 +11,9 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const ipc = @import("ipc.zig");
-const pty = @import("posix/pty.zig");
+const pty = lib.posix;
 const compat = @import("posix/compat.zig");
 const paths = @import("posix/paths.zig");
-const input = @import("input.zig");
 const spawn = @import("spawn.zig");
 // The daemon consumes Session through the public module — same surface an
 // embedder sees — so accidental private reach-ins fail to compile.
@@ -162,7 +161,7 @@ const Client = struct {
     /// Monotonic; Session uses this to route run completions.
     id: u32,
     framer: ipc.Framer,
-    input_cls: input.Classifier,
+    input_cls: lib.Classifier,
     /// Sent `.attach` (vs. one-shot `.run`/`.read`).
     attached: bool = false,
     /// Wants live `.output` frames (set on `.attach` and `.run`).
@@ -730,7 +729,7 @@ fn acceptClient(d: *Daemon, now: i128) !void {
         .fd = fd,
         .id = id,
         .framer = ipc.Framer.init(d.gpa),
-        .input_cls = input.Classifier.init(),
+        .input_cls = lib.Classifier.init(.{}),
         .last_drain_ns = now,
     });
     log.info("client {d} connected (total={d})", .{ id, d.clients.items.len });

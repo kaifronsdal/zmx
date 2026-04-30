@@ -3,11 +3,9 @@ comptime {
     // reference everything binary-side so `zig build test` covers both.
     _ = @import("zmyth");
     _ = @import("ipc.zig");
-    _ = @import("input.zig");
     _ = @import("spawn.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");
     _ = @import("posix/paths.zig");
-    _ = @import("posix/pty.zig");
     _ = @import("posix/compat.zig");
 }

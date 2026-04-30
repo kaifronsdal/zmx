@@ -307,6 +307,83 @@ test "API: SessionEvent.cookie() works for all variants" {
     try testing.expectEqual(@as(u32, 3), evs[2].cookie());
 }
 
+// ───────────────────── Classifier (input direction) ─────────────────────
+
+test "API: Classifier — keystroke vs report, configurable detach" {
+    var c = lib.Classifier.init(.{ .detach_key = ']' });
+    // User keystrokes:
+    try testing.expect(c.feed("hello").user_input);
+    try testing.expect(c.feed("\x1b[A").user_input); // arrow
+    // Terminal reports:
+    try testing.expect(!c.feed("\x1b[?1;2c").user_input); // DA
+    try testing.expect(!c.feed("\x1b[<0;5;5M").user_input); // SGR mouse
+    // Configured detach (Ctrl-] = 0x1d):
+    try testing.expect(c.feed("\x1d").detach);
+    try testing.expect(!c.feed("\x1c").detach); // default Ctrl-\ no longer
+    // Disabled detach still classifies:
+    var c2 = lib.Classifier.init(.{ .detach_key = null });
+    try testing.expect(!c2.feed("\x1d").detach);
+    try testing.expect(c2.feed("\x1d").user_input);
+}
+
+// ───────────────────── tier-3: posix + spawnSpec wiring ─────────────────────
+
+test "API: posix.Pty + hook.spawnSpec — embedder spawns a hooked bash" {
+    // The actual "build your own daemon" recipe: open a PTY, ask spawnSpec
+    // what to write/exec, do it, drive Session from the master fd. Skipped
+    // if bash isn't available.
+    const bash = "/bin/bash";
+    std.fs.accessAbsolute(bash, .{}) catch return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rc_dir = try tmp.dir.realpathAlloc(arena, ".");
+
+    const spec = try lib.hook.spawnSpec(arena, .bash, .{
+        .shell_path = bash,
+        .rc_dir = rc_dir,
+        .body = lib.hook.body(.bash),
+    });
+    for (spec.files) |f| try tmp.dir.writeFile(.{ .sub_path = f.name, .data = f.content });
+
+    var p = try lib.posix.Pty.open();
+    defer p.close();
+    try lib.posix.setWinsize(p.master, .{ .rows = 24, .cols = 80 });
+    const pid = try lib.posix.forkExec(&p, spec.argv, &.{
+        "TERM=xterm-256color",
+        try std.fmt.allocPrintSentinel(arena, "HOME={s}", .{rc_dir}, 0),
+        "PATH=/usr/bin:/bin",
+    });
+    defer {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        _ = std.posix.waitpid(pid, 0);
+    }
+    try lib.posix.setNonBlock(p.master, true);
+
+    // Drive a Session until the hook announces (or 3s budget).
+    var s = try Session.init(testing.allocator, .{ .rows = 24, .cols = 80 });
+    defer s.deinit();
+    var buf: [4096]u8 = undefined;
+    const deadline = std.time.nanoTimestamp() + 3 * sec;
+    while (std.time.nanoTimestamp() < deadline) {
+        const now = std.time.nanoTimestamp();
+        const n = std.posix.read(p.master, &buf) catch |e| switch (e) {
+            error.WouldBlock => 0,
+            else => return e,
+        };
+        if (n > 0) try s.feedPty(buf[0..n], now);
+        s.tick(now);
+        if (s.state().hooked) break;
+        std.Thread.sleep(5 * ms);
+    }
+    try testing.expect(s.state().hooked);
+    try testing.expectEqual(Shell.bash, s.state().shell);
+}
+
 // ───────────────────── state() snapshot ─────────────────────
 
 test "API: state() reflects feedPty side-effects" {

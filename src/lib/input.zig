@@ -1,35 +1,47 @@
-//! Persistent classifier for client→daemon input bytes.
+//! Persistent classifier for terminal→application input bytes (the
+//! input-direction dual of `protocol.Scanner`).
 //!
-//! Answers, per chunk: (a) did the user press the detach key (Ctrl-\)? and
-//! (b) does this chunk contain real user keystrokes (vs. only terminal-
-//! generated reports like DA/CPR/focus/mouse)?
+//! Answers, per chunk: (a) did the user press the configured detach chord?
+//! and (b) does this chunk contain real user keystrokes, vs. only terminal-
+//! generated reports (DA/CPR/focus/mouse/DECRPM)?
 //!
-//! Unlike the v1 implementation, parser state persists across feed() calls so
-//! escape sequences split across read() boundaries are handled correctly
-//! (GitHub #135, #124).
+//! (b) is what a multi-attach embedder needs for leader election: with N
+//! terminals attached, every one answers `\e[6n`; only the human's should
+//! win. Parser state persists across `feed()` so sequences split across
+//! `read()` boundaries classify correctly.
 
 const std = @import("std");
 const vt = @import("ghostty-vt");
 
-const Result = struct {
-    /// Ctrl-\ was seen anywhere in this chunk (any encoding).
+pub const Options = struct {
+    /// Ctrl+<this char> detaches, in any of three encodings: legacy C0
+    /// (`key & 0x1f`), kitty `CSI <key>;<mod> u`, xterm modifyOtherKeys
+    /// `CSI 27;<mod>;<key> ~`. Must be in 0x40..0x7f (the C0-mappable
+    /// range). `null` disables detach detection — embedders that handle
+    /// detach themselves still get `user_input` classification.
+    detach_key: ?u8 = '\\',
+};
+
+pub const Result = struct {
+    /// Ctrl+<detach_key> was seen anywhere in this chunk (any encoding).
     detach: bool,
     /// At least one byte/sequence was a real keypress (not a terminal report).
     user_input: bool,
 };
 
 pub const Classifier = struct {
+    opts: Options,
     parser: vt.Parser,
     /// Bytes to swallow following a legacy mouse report (CSI M + 3 bytes).
-    skip_bytes: u8,
+    skip_bytes: u8 = 0,
     /// Inside a bracketed-paste (`\e[200~`…`\e[201~`). The detach key is
-    /// suppressed here so a clipboard containing 0x1c (binary garbage,
+    /// suppressed here so a clipboard containing the C0 byte (binary garbage,
     /// terminal recordings) doesn't detach the session. The outer terminal
     /// only emits these when it has paste enabled, so we can trust them.
-    in_paste: bool,
+    in_paste: bool = false,
 
-    pub fn init() Classifier {
-        return .{ .parser = .init(), .skip_bytes = 0, .in_paste = false };
+    pub fn init(opts: Options) Classifier {
+        return .{ .opts = opts, .parser = .init() };
     }
 
     pub fn feed(self: *Classifier, bytes: []const u8) Result {
@@ -54,7 +66,9 @@ pub const Classifier = struct {
                     .print => r.user_input = true,
                     .execute => |code| {
                         r.user_input = true;
-                        if (code == 0x1c and !self.in_paste) r.detach = true;
+                        if (!self.in_paste) if (self.opts.detach_key) |k| {
+                            if (code == k & 0x1f) r.detach = true;
+                        };
                     },
                     .csi_dispatch => |csi| self.classifyCsi(csi, &r),
                     // Alt+key, vi-mode ESC-then-key, SS3 fn keys all surface
@@ -118,15 +132,16 @@ pub const Classifier = struct {
         r.user_input = true;
 
         // Detach-key check. Modifier param encodes (1 + bitfield); Ctrl is bit 2.
+        const dk = self.opts.detach_key orelse return;
         switch (csi.final) {
             // kitty: CSI key ; mod u
-            'u' => if (csi.params.len >= 2 and csi.params[0] == '\\' and
+            'u' => if (csi.params.len >= 2 and csi.params[0] == dk and
                 ctrlHeld(csi.params[1])) {
                 r.detach = true;
             },
             // xterm modifyOtherKeys: CSI 27 ; mod ; key ~
             '~' => if (csi.params.len >= 3 and csi.params[0] == 27 and
-                csi.params[2] == '\\' and ctrlHeld(csi.params[1]))
+                csi.params[2] == dk and ctrlHeld(csi.params[1]))
             {
                 r.detach = true;
             },
@@ -150,7 +165,7 @@ fn expectFeed(c: *Classifier, bytes: []const u8, detach: bool, user: bool) !void
 }
 
 fn expectOne(bytes: []const u8, detach: bool, user: bool) !void {
-    var c = Classifier.init();
+    var c = Classifier.init(.{});
     try expectFeed(&c, bytes, detach, user);
 }
 
@@ -219,7 +234,7 @@ test "bracketed paste markers are not user input but content is" {
 test "T4: 0x1c inside bracketed paste does NOT detach" {
     try expectOne("\x1b[200~before\x1cafter\x1b[201~", false, true);
     // Split across feeds: paste-open in one, 0x1c in the next.
-    var c = Classifier.init();
+    var c = Classifier.init(.{});
     try expectFeed(&c, "\x1b[200~", false, false);
     try expectFeed(&c, "\x1c", false, true);
     try expectFeed(&c, "\x1b[201~", false, false);
@@ -236,7 +251,7 @@ test "SS3 function key is user input" {
 }
 
 test "vi-mode ESC then key is user input" {
-    var c = Classifier.init();
+    var c = Classifier.init(.{});
     // Lone ESC: parser enters escape state, no action yet — that's fine,
     // the very next byte will produce esc_dispatch which counts.
     try expectFeed(&c, "\x1b", false, false);
@@ -256,7 +271,7 @@ test "UTF-8 with all bytes >=0xA0 is user input" {
 }
 
 test "UTF-8 byte 0x9D doesn't wedge parser for following ASCII" {
-    var c = Classifier.init();
+    var c = Classifier.init(.{});
     // Without the fix, 0x9D → osc_string state; the following 'x' becomes
     // .osc_put → user_input=false until an ESC arrives.
     try expectFeed(&c, "\x9d", false, true);
@@ -264,7 +279,7 @@ test "UTF-8 byte 0x9D doesn't wedge parser for following ASCII" {
 }
 
 test "boundary split: kitty Ctrl-\\ across two feeds" {
-    var c = Classifier.init();
+    var c = Classifier.init(.{});
     try expectFeed(&c, "\x1b[92;", false, false);
     try expectFeed(&c, "5u", true, true);
 }
@@ -273,14 +288,14 @@ test "boundary split: DA reply at every offset never user input" {
     const seq = "\x1b[?1;2c";
     var i: usize = 1;
     while (i < seq.len) : (i += 1) {
-        var c = Classifier.init();
+        var c = Classifier.init(.{});
         try expectFeed(&c, seq[0..i], false, false);
         try expectFeed(&c, seq[i..], false, false);
     }
 }
 
 test "boundary split: legacy mouse trailing bytes across feeds" {
-    var c = Classifier.init();
+    var c = Classifier.init(.{});
     try expectFeed(&c, "\x1b[M ", false, false);
     try expectFeed(&c, "ab", false, false);
 }
@@ -301,13 +316,13 @@ test "urxvt mouse does not swallow following bytes" {
     // Regression: previously every final-'M' set skip_bytes=3, so the three
     // bytes after a urxvt mouse report were silently eaten. urxvt encodes
     // coords as CSI params and has no trailing bytes; only legacy X10 does.
-    var c = Classifier.init();
+    var c = Classifier.init(.{});
     try expectFeed(&c, "\x1b[32;10;20M", false, false);
     try expectFeed(&c, "x", false, true);
 }
 
 test "legacy mouse (no params) still swallows 3 bytes after fix" {
-    var c = Classifier.init();
+    var c = Classifier.init(.{});
     try expectFeed(&c, "\x1b[M", false, false);
     try expectFeed(&c, "abc", false, false);
     try expectFeed(&c, "d", false, true);
@@ -326,4 +341,19 @@ test "DECRPM reply (DEC private mode) is not user input" {
 test "plain 'y'-final CSI without '$' is still user input" {
     // Guard against the DECRPM fix being over-broad.
     try expectOne("\x1b[1;5y", false, true);
+}
+
+test "Options: custom detach_key" {
+    var c = Classifier.init(.{ .detach_key = 'A' });
+    try expectFeed(&c, "\x01", true, true); // Ctrl-A legacy
+    try expectFeed(&c, "\x1c", false, true); // Ctrl-\ no longer detaches
+    try expectFeed(&c, "\x1b[65;5u", true, true); // kitty Ctrl-A
+    try expectFeed(&c, "\x1b[27;5;65~", true, true); // xterm Ctrl-A
+}
+
+test "Options: detach_key=null disables detach, keeps classification" {
+    var c = Classifier.init(.{ .detach_key = null });
+    try expectFeed(&c, "\x1c", false, true);
+    try expectFeed(&c, "\x1b[92;5u", false, true);
+    try expectFeed(&c, "\x1b[?1;2c", false, false); // still classifies reports
 }
