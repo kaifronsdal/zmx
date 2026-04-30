@@ -78,6 +78,14 @@ pub fn build(b: *std.Build) void {
         @import("build.zig.zon").dependencies.ghostty.hash,
     );
 
+    // ── library module (for embedders: `b.dependency("zmyth").module("zmyth")`) ──
+    const lib_mod = b.addModule("zmyth", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addGhosttyVt(b, lib_mod, target, optimize);
+
     // ── exe ──────────────────────────────────────────────────────────────
     const exe = b.addExecutable(.{
         .name = "zmyth",
@@ -108,6 +116,11 @@ pub fn build(b: *std.Build) void {
     });
     unit.linkLibC();
     test_step.dependOn(&b.addRunArtifact(unit).step);
+    // Public-API tests build against the exported lib module (same surface
+    // an embedder sees), not the internal source tree.
+    const api = b.addTest(.{ .root_module = lib_mod });
+    api.linkLibC();
+    test_step.dependOn(&b.addRunArtifact(api).step);
 
     // ── integration tests ────────────────────────────────────────────────
     const install_exe = b.addInstallArtifact(exe, .{});
