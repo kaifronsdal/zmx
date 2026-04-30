@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const lib = @import("lib.zig");
+const lib = @import("root.zig");
 
 const Session = lib.Session;
 const SessionEvent = lib.SessionEvent;

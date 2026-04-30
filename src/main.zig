@@ -1,9 +1,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const client = @import("client.zig");
-const io = @import("io.zig");
-const outf = io.outf;
-const errf = io.errf;
+const outf = client.outf;
+const errf = client.errf;
 
 const usage =
     \\zmyth — minimal session manager

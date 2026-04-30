@@ -5,7 +5,7 @@
 set -u
 source "$(dirname "$0")/lib.sh"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ASSETS="$HERE/../../src/assets"
+ASSETS="$HERE/../../src/lib/assets"
 
 echo "── hook.bash under set -e (B9: arithmetic returning false aborts) ──"
 out=$(bash --norc -ec '

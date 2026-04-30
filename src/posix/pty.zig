@@ -72,7 +72,7 @@ pub fn getWinsize(fd: posix.fd_t) !Winsize {
 
 /// Re-export: daemon.zig still calls `pty.setNonBlock`; the impl lives in
 /// io.zig since it's used on sockets too, not just PTYs.
-pub const setNonBlock = @import("io.zig").setNonBlock;
+pub const setNonBlock = @import("compat.zig").setNonBlock;
 
 // ---- Pty -----------------------------------------------------------------
 

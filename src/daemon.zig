@@ -11,14 +11,16 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const ipc = @import("ipc.zig");
-const pty = @import("pty.zig");
-const compat = @import("compat.zig");
-const paths = @import("paths.zig");
-const shell = @import("shell.zig");
-const protocol = @import("protocol.zig");
+const pty = @import("posix/pty.zig");
+const compat = @import("posix/compat.zig");
+const paths = @import("posix/paths.zig");
 const input = @import("input.zig");
-const session_mod = @import("session.zig");
-const Session = session_mod.Session;
+const spawn = @import("spawn.zig");
+// The daemon consumes Session through the public module — same surface an
+// embedder sees — so accidental private reach-ins fail to compile.
+const lib = @import("zmyth");
+const Session = lib.Session;
+const hook = lib.hook;
 
 const log = std.log.scoped(.daemon);
 
@@ -198,7 +200,7 @@ const Daemon = struct {
     shell_pid: posix.pid_t,
     /// What `spawnShell` detected from `$SHELL`. `.unknown` means the shell will
     /// never announce, so `.run` requests cannot work — refuse them up front.
-    spawned_shell: protocol.Shell,
+    spawned_shell: lib.Shell,
     /// Set by the SIGCHLD reaper if it wins the race against handlePtyEof.
     shell_status: ?u32 = null,
     listen_fd: posix.fd_t,
@@ -305,7 +307,7 @@ fn daemonMain(name: []const u8, initial_cmd: ?[]const []const u8) !void {
     // Non-blocking master so the poll loop never wedges on read/write.
     try pty.setNonBlock(p.master, true);
 
-    const spawned = try shell.spawnShell(gpa, &p, name, sp.rc_dir, sp.env_dir, initial_cmd);
+    const spawned = try spawn.spawnShell(gpa, &p, name, sp.rc_dir, sp.env_dir, initial_cmd);
 
     // ── listen (lock held; safe to clear any stale socket file) ──────
     posix.unlink(sp.sock) catch {};
@@ -644,7 +646,7 @@ fn routeEvents(d: *Daemon) void {
                 .installed => |sh| queueOrClose(c, .ack, std.fmt.bufPrint(
                     &b,
                     "installed → {s}/hook.{s}",
-                    .{ shell.hook_dir, @tagName(sh) },
+                    .{ hook.dir, @tagName(sh) },
                 ) catch "installed"),
                 .err => |e| queueOrClose(c, .err, e),
             },
@@ -831,7 +833,7 @@ fn handleAttach(d: *Daemon, c: *Client, payload: []const u8) !void {
     d.promoteLeader(c);
 
     // Env refresh (#104): KEY=VAL\0KEY=VAL\0...
-    shell.refreshEnvLinks(d.sp.env_dir, payload[4..]) catch |err| {
+    spawn.refreshEnvLinks(d.sp.env_dir, payload[4..]) catch |err| {
         log.warn("env refresh: {s}", .{@errorName(err)});
     };
 
@@ -981,7 +983,7 @@ fn handleWriteBegin(d: *Daemon, c: *Client, payload: []const u8) !void {
     const gzip = payload[0] == 'z';
     const enc_len = std.mem.readInt(u64, payload[1..9], .little);
 
-    const opener = try shell.writeOpener(d.gpa, d.session.state().shell, w.path, enc_len, gzip);
+    const opener = try hook.writeOpener(d.gpa, d.session.state().shell, w.path, enc_len, gzip);
     defer d.gpa.free(opener);
     try d.session.send(opener);
 
@@ -1008,11 +1010,11 @@ fn endWrite(d: *Daemon, n_written: ?u64) void {
 }
 
 fn typeTrace(d: *Daemon, n: u64, path: []const u8) !void {
-    const q = try shell.posixQuote(d.gpa, path);
+    const q = try hook.posixQuote(d.gpa, path);
     defer d.gpa.free(q);
     const msg = try std.fmt.allocPrint(d.gpa, ": zmyth: wrote {d} bytes to {s}", .{ n, q });
     defer d.gpa.free(msg);
-    const trace = try shell.wrapPaste(d.gpa, msg);
+    const trace = try hook.wrapPaste(d.gpa, msg);
     defer d.gpa.free(trace);
     try d.session.send(trace);
 }
@@ -1027,7 +1029,7 @@ fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
             try c.framer.queue(.ack, "");
             return;
         }
-        @import("io.zig").writeAllFd(fd, payload) catch |e| {
+        @import("posix/compat.zig").writeAllFd(fd, payload) catch |e| {
             endWrite(d, null);
             return queueErr(c, "write: {s}", .{@errorName(e)});
         };

@@ -70,7 +70,7 @@ pub const RunDoneWire = extern struct {
     _pad: [3]u8 = .{ 0, 0, 0 },
     dur_ms: u64,
 
-    pub const Via = @import("session.zig").Via;
+    pub const Via = @import("zmyth").Via;
     pub const null_exit: i32 = std.math.minInt(i32);
 
     pub fn exitCode(self: RunDoneWire) ?i32 {
@@ -194,7 +194,7 @@ pub const Framer = struct {
 // uses Framer directly).
 // ---------------------------------------------------------------------------
 
-const writeAll = @import("io.zig").writeAllFd;
+const writeAll = @import("posix/compat.zig").writeAllFd;
 
 fn readExact(fd: posix.fd_t, buf: []u8) !void {
     var off: usize = 0;

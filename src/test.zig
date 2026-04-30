@@ -1,13 +1,13 @@
 comptime {
-    _ = @import("protocol.zig");
-    _ = @import("shell.zig");
+    // Library tests run via the `zmyth` module's own test step; here we
+    // reference everything binary-side so `zig build test` covers both.
+    _ = @import("zmyth");
     _ = @import("ipc.zig");
-    _ = @import("io.zig");
-    _ = @import("paths.zig");
-    _ = @import("pty.zig");
     _ = @import("input.zig");
-    _ = @import("term_state.zig");
-    _ = @import("session.zig");
+    _ = @import("spawn.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");
+    _ = @import("posix/paths.zig");
+    _ = @import("posix/pty.zig");
+    _ = @import("posix/compat.zig");
 }

@@ -7,25 +7,36 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const ipc = @import("ipc.zig");
-const paths = @import("paths.zig");
-const pty = @import("pty.zig");
-const compat = @import("compat.zig");
-const io = @import("io.zig");
-
+const paths = @import("posix/paths.zig");
+const pty = @import("posix/pty.zig");
+const compat = @import("posix/compat.zig");
 const daemon = @import("daemon.zig");
+const spawn = @import("spawn.zig");
+const lib = @import("zmyth");
 
-const writeAllFd = io.writeAllFd;
-const outf = io.outf;
-const errf = io.errf;
+const writeAllFd = compat.writeAllFd;
 const eq = std.mem.eql;
+const env_forward = spawn.env_forward;
 
 // Loopback RTT is <1ms; a healthy daemon answers `.info` instantly. These
 // bound how long `ls` stalls on a hung/unresponsive daemon, so keep them tight.
 const probe_connect_ms = 100;
 const probe_recv_timeout_us = 100_000;
 
-const sh = @import("shell.zig");
-const env_forward = sh.env_forward;
+/// Streaming (non-positional) formatted write to stdout.
+pub fn outf(comptime fmt: []const u8, args: anytype) !void {
+    var buf: [1024]u8 = undefined;
+    try std.fs.File.stdout().writeAll(try std.fmt.bufPrint(&buf, fmt, args));
+}
+
+/// Best-effort: errors writing to stderr are swallowed. On format overflow,
+/// emit a marker rather than truncated noise (bufPrint fills the buffer
+/// before erroring, so the partial content has no trailing newline).
+pub fn errf(comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, fmt, args) catch "zmyth: <error message overflow>\n";
+    std.fs.File.stderr().writeAll(s) catch {};
+}
 
 // ---- shared verb prologue ------------------------------------------------
 
@@ -167,7 +178,7 @@ fn probeAll(allocator: Allocator, names: []const []const u8) ![]Probe {
         if (re & (posix.POLL.ERR | posix.POLL.HUP) != 0) continue;
         posix.getsockoptError(fd) catch continue;
         // Flip back to blocking for the request/reply.
-        io.setNonBlock(fd, false) catch continue;
+        compat.setNonBlock(fd, false) catch continue;
         // Bound the wait so a wedged daemon can't hang `ls`.
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&recv_to)) catch {};
 
@@ -325,7 +336,7 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
     };
 
     // Make socket nonblocking for the Framer-driven pump.
-    try io.setNonBlock(sock, true);
+    try compat.setNonBlock(sock, true);
 
     var framer = ipc.Framer.init(allocator);
     defer framer.deinit();
@@ -522,12 +533,12 @@ pub fn hook(allocator: Allocator, args: []const [:0]const u8) !u8 {
         try writeAllFd(
             posix.STDOUT_FILENO,
             "# zmyth hook — add ONE of these to the target shell's rc:\n\n" ++
-                "# bash (~/.bashrc):\n" ++ sh.rcSourceLine(.bash) ++ "\n\n" ++
-                "# zsh (~/.zshrc):\n" ++ sh.rcSourceLine(.zsh) ++ "\n\n" ++
-                "# fish (~/.config/fish/conf.d/zmyth.fish):\n" ++ sh.rcSourceLine(.fish) ++ "\n\n" ++
+                "# bash (~/.bashrc):\n" ++ lib.hook.rcSourceLine(.bash) ++ "\n\n" ++
+                "# zsh (~/.zshrc):\n" ++ lib.hook.rcSourceLine(.zsh) ++ "\n\n" ++
+                "# fish (~/.config/fish/conf.d/zmyth.fish):\n" ++ lib.hook.rcSourceLine(.fish) ++ "\n\n" ++
                 "# Or, with the session at the target shell's prompt:\n" ++
                 "#   zmyth hook <session>\n" ++
-                "# which writes " ++ sh.hook_dir ++ "/hook.<shell> and appends the line above.\n",
+                "# which writes " ++ lib.hook.dir ++ "/hook.<shell> and appends the line above.\n",
         );
         return 0;
     }
@@ -909,7 +920,7 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
             const src = if (use_gz) gz_buf else raw.items;
             var begin: [9]u8 = undefined;
             begin[0] = if (use_gz) 'z' else 'p';
-            std.mem.writeInt(u64, begin[1..9], sh.writeEncLen(src.len), .little);
+            std.mem.writeInt(u64, begin[1..9], lib.hook.writeEncLen(src.len), .little);
             try ipc.sendBlocking(sock, .write_begin, &begin);
             const ack = try ipc.recvBlocking(allocator, sock);
             defer allocator.free(ack.payload);

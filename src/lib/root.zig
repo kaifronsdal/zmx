@@ -19,7 +19,7 @@
 
 const session = @import("session.zig");
 const proto = @import("protocol.zig");
-const sh = @import("shell.zig");
+const hk = @import("hook.zig");
 
 // ── tier 1: protocol ─────────────────────────────────────────────────────
 
@@ -34,33 +34,19 @@ pub const Shell = proto.Shell;
 pub const Done = proto.Done;
 pub const ProbeResult = proto.ProbeResult;
 
-/// Shell-side half of OSC-2718.
+/// Shell-side half of OSC-2718: hook scripts, probe/install one-liners,
+/// the `write` opener, and shell-string quoting.
 pub const hook = struct {
-    /// Bumped when the rc snippets change; the probe reports it so a
-    /// session can decide whether to re-install.
-    pub const version: u32 = sh.hook_version;
-
-    /// One-liner that detects the running shell and any installed hook.
-    /// Type this (bracketed-paste-wrapped) into an unknown shell; it emits
-    /// an `Event.probe` if it's bash/zsh/fish.
-    pub const probe_line: []const u8 = sh.probe_line;
-
-    /// rc snippet that emits `preexec`/`done` OSCs.
-    pub fn body(shell: Shell) []const u8 {
-        return sh.hookBody(shell);
-    }
-
-    /// Full install command for `shell`: a paste-wrapped one-liner that
-    /// writes `body()` to `~/.config/zmyth/hook.<shell>`, sources it, and
-    /// appends a guarded source line to the shell's rc. Caller frees.
-    pub fn buildInstall(gpa: @import("std").mem.Allocator, shell: Shell) ![]u8 {
-        return sh.buildInstall(gpa, shell);
-    }
-
-    /// Wrap `s` as `^U \e[200~ s \e[201~ \r` for typing into a line editor.
-    pub fn wrapPaste(gpa: @import("std").mem.Allocator, s: []const u8) ![]u8 {
-        return sh.wrapPaste(gpa, s);
-    }
+    pub const version: u32 = hk.hook_version;
+    pub const dir: []const u8 = hk.hook_dir;
+    pub const probe_line: []const u8 = hk.probe_line;
+    pub const body = hk.hookBody;
+    pub const rcSourceLine = hk.rcSourceLine;
+    pub const buildInstall = hk.buildInstall;
+    pub const wrapPaste = hk.wrapPaste;
+    pub const writeOpener = hk.writeOpener;
+    pub const writeEncLen = hk.writeEncLen;
+    pub const posixQuote = hk.posixQuote;
 };
 
 // ── tier 2: Session ──────────────────────────────────────────────────────

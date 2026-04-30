@@ -43,7 +43,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const vt = @import("ghostty-vt");
 const protocol = @import("protocol.zig");
-const shell = @import("shell.zig");
+const shell = @import("hook.zig");
 const term_state = @import("term_state.zig");
 
 const Allocator = std.mem.Allocator;

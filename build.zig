@@ -30,6 +30,7 @@ fn module(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     options: *std.Build.Step.Options,
+    lib_mod: *std.Build.Module,
 ) *std.Build.Module {
     const m = b.createModule(.{
         .root_source_file = b.path(root),
@@ -37,6 +38,29 @@ fn module(
         .optimize = optimize,
     });
     m.addOptions("build_options", options);
+    // The binary consumes Session/hook/etc through the public module —
+    // same surface an embedder sees — so the library boundary is enforced
+    // by the build, not just the directory layout.
+    m.addImport("zmyth", lib_mod);
+    addGhosttyVt(b, m, target, optimize);
+    return m;
+}
+
+fn libModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    /// Register as `b.dependency("zmyth").module("zmyth")` for embedders.
+    /// Only the default-target instance is named; release per-target
+    /// instances are anonymous (addModule with the same name twice panics).
+    named: bool,
+) *std.Build.Module {
+    const opts: std.Build.Module.CreateOptions = .{
+        .root_source_file = b.path("src/lib/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    };
+    const m = if (named) b.addModule("zmyth", opts) else b.createModule(opts);
     addGhosttyVt(b, m, target, optimize);
     return m;
 }
@@ -79,17 +103,12 @@ pub fn build(b: *std.Build) void {
     );
 
     // ── library module (for embedders: `b.dependency("zmyth").module("zmyth")`) ──
-    const lib_mod = b.addModule("zmyth", .{
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    addGhosttyVt(b, lib_mod, target, optimize);
+    const lib_mod = libModule(b, target, optimize, true);
 
     // ── exe ──────────────────────────────────────────────────────────────
     const exe = b.addExecutable(.{
         .name = "zmyth",
-        .root_module = module(b, "src/main.zig", target, optimize, options),
+        .root_module = module(b, "src/main.zig", target, optimize, options, lib_mod),
     });
     exe.linkLibC();
     b.installArtifact(exe);
@@ -104,7 +123,7 @@ pub fn build(b: *std.Build) void {
     const check = b.step("check", "Type-check without emitting a binary");
     const exe_check = b.addExecutable(.{
         .name = "zmyth",
-        .root_module = module(b, "src/main.zig", target, optimize, options),
+        .root_module = module(b, "src/main.zig", target, optimize, options, lib_mod),
     });
     exe_check.linkLibC();
     check.dependOn(&exe_check.step);
@@ -112,7 +131,7 @@ pub fn build(b: *std.Build) void {
     // ── unit tests ───────────────────────────────────────────────────────
     const test_step = b.step("test", "Run unit tests");
     const unit = b.addTest(.{
-        .root_module = module(b, "src/test.zig", target, optimize, options),
+        .root_module = module(b, "src/test.zig", target, optimize, options, lib_mod),
     });
     unit.linkLibC();
     test_step.dependOn(&b.addRunArtifact(unit).step);
@@ -163,7 +182,7 @@ pub fn build(b: *std.Build) void {
         const rt = b.resolveTargetQuery(q);
         const rexe = b.addExecutable(.{
             .name = "zmyth",
-            .root_module = module(b, "src/main.zig", rt, .ReleaseSafe, options),
+            .root_module = module(b, "src/main.zig", rt, .ReleaseSafe, options, libModule(b, rt, .ReleaseSafe, false)),
         });
         rexe.linkLibC();
 
