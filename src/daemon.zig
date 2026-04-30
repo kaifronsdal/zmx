@@ -434,7 +434,7 @@ fn runLoop(d: *Daemon) !void {
             routeCompletions(d);
         }
         // Hook-install timeout + completion routing.
-        d.session.checkHookTimeout(now);
+        d.session.checkDeadlines(now);
         routeHookCompletion(d);
         // Prompt-wait check (front run never typed because shell hasn't
         // reached its first prompt). Soft warn at 5s, hard fail at 30s.
