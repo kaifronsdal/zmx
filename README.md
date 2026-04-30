@@ -9,9 +9,9 @@ terminal scrollback via [ghostty-vt](https://github.com/ghostty-org/ghostty)
 — and replaces the `; echo MARKER` exit-code mechanism with a shell-
 integration protocol (OSC 2718) that's robust to multi-line commands,
 output that contains the marker, prompt customisation, and nested shells.
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the protocol and
-[`docs/FINDINGS.md`](docs/FINDINGS.md) for the bugs in the original
-approach that motivated it.
+See [`docs/DESIGN.md`](docs/DESIGN.md) for how it works and why, and
+[`docs/archive/`](docs/archive/) for the rewrite-planning notes and the
+bug catalogue that motivated it.
 
 ## Install
 
