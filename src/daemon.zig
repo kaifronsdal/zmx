@@ -17,8 +17,8 @@ const paths = @import("paths.zig");
 const shell = @import("shell.zig");
 const protocol = @import("protocol.zig");
 const input = @import("input.zig");
-const term_state = @import("term_state.zig");
-const Session = @import("session.zig").Session;
+const session_mod = @import("session.zig");
+const Session = session_mod.Session;
 
 const log = std.log.scoped(.daemon);
 
@@ -147,7 +147,7 @@ const WriteState = struct {
     begun: bool = false,
     /// `session.preexec_count` snapshot at `.write_begin`. The deferred ack
     /// releases once the count has advanced past this — robust to preexec
-    /// and done landing in the same `feedPtyOutput` (which would leave
+    /// and done landing in the same `feedPty` (which would leave
     /// `cmd_running` false by the time the daemon checks).
     preexec_at_begin: u64 = 0,
     /// A `.write_begin`/`.write_data` ack is owed once preexec has advanced
@@ -298,7 +298,7 @@ fn daemonMain(name: []const u8, initial_cmd: ?[]const []const u8) !void {
     };
 
     // ── spawn shell into a PTY ───────────────────────────────────────
-    const session = try Session.init(gpa, 24, 80);
+    const session = try Session.init(gpa, .{ .rows = 24, .cols = 80 });
 
     var p = try pty.Pty.open();
     try pty.setWinsize(p.master, .{ .rows = 24, .cols = 80 });
@@ -374,7 +374,7 @@ fn runLoop(d: *Daemon) !void {
             .revents = 0,
         });
         var pty_ev: i16 = posix.POLL.IN;
-        if (d.session.pendingPtyInput().len > 0) pty_ev |= posix.POLL.OUT;
+        if (d.session.pendingInput().len > 0) pty_ev |= posix.POLL.OUT;
         try d.pollfds.append(d.gpa, .{ .fd = d.pty_fd, .events = pty_ev, .revents = 0 });
         for (d.clients.items) |*c| {
             var ev: i16 = posix.POLL.IN;
@@ -382,11 +382,16 @@ fn runLoop(d: *Daemon) !void {
             try d.pollfds.append(d.gpa, .{ .fd = c.fd, .events = ev, .revents = 0 });
         }
 
-        // 300ms timeout if a typed run is awaiting acceptance, else block.
-        const timeout: ?posix.timespec = if (d.session.needsTimeoutWake())
-            .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms }
-        else
-            null;
+        // Exact wake at the next session deadline, capped to 1s so a fresh
+        // observation (e.g. flush completing) doesn't sit unchecked.
+        const timeout: ?posix.timespec = if (d.session.nextDeadline()) |dl| blk: {
+            const ms: i64 = @intCast(std.math.clamp(
+                @divTrunc(dl - std.time.nanoTimestamp(), std.time.ns_per_ms),
+                1,
+                1000,
+            ));
+            break :blk .{ .sec = @divTrunc(ms, 1000), .nsec = @rem(ms, 1000) * std.time.ns_per_ms };
+        } else null;
         // ppoll (not poll): std.posix.poll retries EINTR internally, which
         // would prevent the SIGTERM flag from being observed promptly. The
         // mask atomically unblocks TERM/INT/CHLD only for the duration of
@@ -417,7 +422,7 @@ fn runLoop(d: *Daemon) !void {
         }
 
         // ── pty_fd ───────────────────────────────────────────────────
-        if (try servicePty(d, d.pollfds.items[idx_pty].revents, &read_buf)) break;
+        if (try servicePty(d, d.pollfds.items[idx_pty].revents, &read_buf, now)) break;
 
         // ── client fds ───────────────────────────────────────────────
         // Only iterate clients that existed when pollfds was built.
@@ -429,36 +434,8 @@ fn runLoop(d: *Daemon) !void {
             serviceClient(d, c, d.pollfds.items[fixed_fds + i].revents, &read_buf, now);
         }
 
-        // Acceptance-timeout check (front run typed but no preexec yet).
-        if (d.session.checkAcceptanceTimeout(now)) {
-            routeCompletions(d);
-        }
-        // Hook-install timeout + completion routing.
-        d.session.checkDeadlines(now);
-        routeHookCompletion(d);
-        // Prompt-wait check (front run never typed because shell hasn't
-        // reached its first prompt). Soft warn at 5s, hard fail at 30s.
-        switch (d.session.checkPromptWait(now)) {
-            .none => {},
-            .warn => |cid| if (d.findClient(cid)) |wc| {
-                queueErr(
-                    wc,
-                    "still waiting (shell starting, or a previous command is still running)…",
-                    .{},
-                ) catch {};
-            },
-            .timeout => |cid| {
-                if (d.findClient(cid)) |wc| {
-                    queueErr(
-                        wc,
-                        "shell never reached a prompt after 30s; " ++
-                            "integration unavailable for this session",
-                        .{},
-                    ) catch {};
-                }
-                routeCompletions(d);
-            },
-        }
+        d.session.tick(now);
+        routeEvents(d);
 
         reapChildren(d);
         reapClosedClients(d, now);
@@ -494,7 +471,7 @@ fn assessClients(d: *Daemon, now: i128) void {
             break;
         };
     }
-    d.session.has_leader = d.leader_id != null;
+    d.session.setLeaderAttached(d.leader_id != null);
 }
 
 /// Non-blocking read: `null` on EAGAIN, `0` on EOF or error, else byte count.
@@ -510,9 +487,9 @@ fn readNb(fd: posix.fd_t, buf: []u8) ?usize {
 
 /// Drain queued PTY input (POLLOUT), then read PTY output (POLLIN/HUP) and
 /// broadcast it. Returns true on PTY EOF — caller breaks the poll loop.
-fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
+fn servicePty(d: *Daemon, re: i16, read_buf: []u8, now: i128) !bool {
     if (re & posix.POLL.OUT != 0) {
-        const pending = d.session.pendingPtyInput();
+        const pending = d.session.pendingInput();
         if (pending.len > 0) {
             const n = posix.write(d.pty_fd, pending) catch |err| switch (err) {
                 error.WouldBlock => 0,
@@ -521,7 +498,7 @@ fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
                     break :blk 0;
                 },
             };
-            d.session.consumePtyInput(n);
+            d.session.consumeInput(n, now);
         }
         releaseWriteAck(d);
     }
@@ -529,13 +506,13 @@ fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
 
     const n = readNb(d.pty_fd, read_buf) orelse return false;
     if (n == 0) {
-        handlePtyEof(d);
+        handlePtyEof(d, now);
         return true;
     }
     const data = read_buf[0..n];
-    d.session.feedPtyOutput(data) catch |e| {
+    d.session.feedPty(data, now) catch |e| {
         // ghostty alloc failure: drop this chunk, keep the daemon alive.
-        log.warn("feedPtyOutput: {s}; dropping {d}B", .{ @errorName(e), data.len });
+        log.warn("feedPty: {s}; dropping {d}B", .{ @errorName(e), data.len });
     };
     releaseWriteAck(d);
     // Broadcast to clients that want live output. Health (stall/demote) is
@@ -543,7 +520,7 @@ fn servicePty(d: *Daemon, re: i16, read_buf: []u8) !bool {
     for (d.clients.items) |*c| {
         if (c.wants_output and !c.closed) queueOrClose(c, .output, data);
     }
-    routeCompletions(d);
+    routeEvents(d);
     return false;
 }
 
@@ -565,7 +542,7 @@ fn serviceClient(d: *Daemon, c: *Client, re: i16, read_buf: []u8, now: i128) voi
                     c.closed = true;
                     break :blk null;
                 }) |msg| {
-                    dispatch(d, c, msg) catch |err| {
+                    dispatch(d, c, msg, now) catch |err| {
                         log.warn("dispatch tag={d} client={d}: {s}", .{
                             @intFromEnum(msg.tag), c.id, @errorName(err),
                         });
@@ -610,7 +587,7 @@ fn flushClient(c: *Client, now: i128) void {
     c.framer.consumeWrite(n);
 }
 
-fn handlePtyEof(d: *Daemon) void {
+fn handlePtyEof(d: *Daemon, now: i128) void {
     log.info("pty EOF; shell exited", .{});
     // The shell has closed the slave end so it is (almost certainly) exiting.
     // We can't block in waitpid(0) here — TERM/INT are masked outside ppoll,
@@ -631,8 +608,8 @@ fn handlePtyEof(d: *Daemon) void {
         break :blk d.shell_status orelse 0;
     };
     d.shell_status = status;
-    d.session.onPtyEof(status);
-    routeCompletions(d);
+    d.session.onPtyEof(status, now);
+    routeEvents(d);
     drainWaiters(d);
     for (d.clients.items) |*c| {
         if (!c.closed) {
@@ -642,49 +619,45 @@ fn handlePtyEof(d: *Daemon) void {
     }
 }
 
-fn routeCompletions(d: *Daemon) void {
-    const comps = d.session.completions();
-    for (comps) |comp| {
-        const c = d.findClient(comp.client_id) orelse continue;
-        if (c.closed) continue;
-        const wire: ipc.RunDoneWire = .{
-            .exit_code = comp.result.exit_code orelse ipc.RunDoneWire.null_exit,
-            .via = comp.result.via,
-            .dur_ms = comp.result.dur_ms,
-        };
-        queueOrClose(c, .run_done, std.mem.asBytes(&wire));
-        c.wants_output = false;
-        c.waiting = false;
-    }
-    if (comps.len > 0) d.session.clearCompletions();
-    // Any transition to idle (run completion, or interactive command's `done`)
-    // releases blocked waiters.
-    if (d.session.isIdle()) drainWaiters(d);
-}
-
-fn routeHookCompletion(d: *Daemon) void {
-    const hc = d.session.takeHookCompletion() orelse return;
-    const c = d.findClient(hc.client_id) orelse return;
-    if (c.closed) return;
+fn routeEvents(d: *Daemon) void {
     var b: [128]u8 = undefined;
-    switch (hc.result) {
-        .already_hooked => |v| queueOrClose(c, .ack, std.fmt.bufPrint(
-            &b,
-            "already hooked (v{d})",
-            .{v},
-        ) catch "already hooked"),
-        .installed => |sh| queueOrClose(c, .ack, std.fmt.bufPrint(
-            &b,
-            "installed → {s}/hook.{s}",
-            .{ shell.hook_dir, @tagName(sh) },
-        ) catch "installed"),
-        .err => |e| queueOrClose(c, .err, e),
+    for (d.session.drainEvents()) |ev| {
+        const c = d.findClient(ev.cookie()) orelse continue;
+        if (c.closed) continue;
+        switch (ev) {
+            .run_done => |rd| {
+                const wire: ipc.RunDoneWire = .{
+                    .exit_code = rd.exit_code orelse ipc.RunDoneWire.null_exit,
+                    .via = rd.via,
+                    .dur_ms = rd.dur_ms,
+                };
+                queueOrClose(c, .run_done, std.mem.asBytes(&wire));
+                c.wants_output = false;
+                c.waiting = false;
+            },
+            .hook_done => |hd| switch (hd.result) {
+                .already_hooked => |v| queueOrClose(c, .ack, std.fmt.bufPrint(
+                    &b,
+                    "already hooked (v{d})",
+                    .{v},
+                ) catch "already hooked"),
+                .installed => |sh| queueOrClose(c, .ack, std.fmt.bufPrint(
+                    &b,
+                    "installed → {s}/hook.{s}",
+                    .{ shell.hook_dir, @tagName(sh) },
+                ) catch "installed"),
+                .err => |e| queueOrClose(c, .err, e),
+            },
+            .warn => |w| queueErr(c, "{s}", .{w.msg}) catch {},
+        }
     }
+    // Any transition to idle releases blocked waiters.
+    if (d.session.state().idle) drainWaiters(d);
 }
 
 fn waitReplyWire(d: *Daemon) ipc.RunDoneWire {
     return .{
-        .exit_code = d.session.last_exit orelse ipc.RunDoneWire.null_exit,
+        .exit_code = d.session.state().last_exit orelse ipc.RunDoneWire.null_exit,
         .via = .osc_done,
         .dur_ms = 0,
     };
@@ -711,14 +684,13 @@ fn reapClosedClients(d: *Daemon, now: i128) void {
         log.info("client {d} disconnected", .{c.id});
         if (d.leader_id == c.id) d.leader_id = null;
         // Don't execute commands queued by a now-dead client.
-        d.session.cancelClientRuns(c.id);
-        d.session.cancelClientHook(c.id);
+        d.session.cancel(c.id);
         // If this client owned an in-flight PTY write that got past
         // `.write_begin`, ^C so the shell returns to the prompt (head -c N
         // would otherwise wait for the missing bytes). For local-FS or a
         // pre-begin abort, endWrite alone suffices.
         if (d.write) |w| if (w.client_id == c.id) {
-            if (w.begun) d.session.queueSend("\x03") catch {};
+            if (w.begun) d.session.send("\x03") catch {};
             endWrite(d, null);
         };
         c.framer.deinit();
@@ -764,7 +736,7 @@ fn acceptClient(d: *Daemon, now: i128) !void {
 
 // ───────────────────────────── dispatch ─────────────────────────────
 
-fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
+fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message, now: i128) !void {
     switch (msg.tag) {
         .attach => try handleAttach(d, c, msg.payload),
         .input => try handleInput(d, c, msg.payload),
@@ -776,7 +748,7 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             // The locally-spawned shell is one we don't know how to hook
             // (e.g. dash), and no layer has announced. `run` would hang
             // waiting for a prompt-ready signal that never comes.
-            if (d.spawned_shell == .unknown and d.session.layers.len == 0) {
+            if (d.spawned_shell == .unknown and d.session.state().depth == 0) {
                 try queueErr(
                     c,
                     "shell integration unavailable for this session " ++
@@ -795,18 +767,18 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
             const interactive = msg.payload.len > 0 and msg.payload[0] == 1;
             const cmd = if (msg.payload.len > 0) msg.payload[1..] else msg.payload;
             c.wants_output = true;
-            try d.session.queueRun(c.id, cmd, interactive);
+            try d.session.run(c.id, cmd, .{ .interactive = interactive }, now);
         },
         .send => {
             if (d.write) |w| if (w.begun)
                 return queueErr(c, "send: write in progress", .{});
-            try d.session.queueSend(msg.payload);
+            try d.session.send(msg.payload);
             try c.framer.queue(.ack, "");
         },
         .read => try handleRead(d, c, msg.payload),
         .info => try handleInfo(d, c),
         .wait => {
-            if (d.session.isIdle()) {
+            if (d.session.state().idle) {
                 const wire = waitReplyWire(d);
                 try c.framer.queue(.run_done, std.mem.asBytes(&wire));
             } else {
@@ -829,10 +801,10 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message) !void {
         .hook => {
             if (d.write) |w| if (w.begun)
                 return queueErr(c, "hook: write in progress", .{});
-            if (try d.session.startHook(c.id, std.time.nanoTimestamp())) |refusal| {
+            if (try d.session.installHook(c.id, now)) |refusal| {
                 try c.framer.queue(.err, refusal);
             }
-            // else: probe queued; completion routed via routeHookCompletion.
+            // else: probe queued; result arrives via routeEvents.
         },
         .detach => {
             try c.framer.queue(.ack, "");
@@ -866,7 +838,7 @@ fn handleAttach(d: *Daemon, c: *Client, payload: []const u8) !void {
     // Serialize terminal state into chunked .state frames (≤256 KiB each).
     var buf: std.Io.Writer.Allocating = .init(d.gpa);
     defer buf.deinit();
-    try term_state.serializeForAttach(&d.session.term, &buf.writer);
+    try d.session.dump(&buf.writer, .attach);
     try queueChunked(c, .state, buf.writer.buffered(), state_chunk);
 }
 
@@ -888,7 +860,7 @@ fn handleInput(d: *Daemon, c: *Client, payload: []const u8) !void {
     // keystrokes already promoted above, so this only drops non-leader
     // *reports* — exactly the duplicates we want to suppress.
     if (d.leader_id != c.id) return;
-    try d.session.queueSend(payload);
+    try d.session.send(payload);
 }
 
 fn handleResize(d: *Daemon, c: *Client, payload: []const u8) !void {
@@ -909,10 +881,7 @@ fn handleRead(d: *Daemon, c: *Client, payload: []const u8) !void {
     var buf: std.Io.Writer.Allocating = .init(d.gpa);
     defer buf.deinit();
 
-    if (mode == 1)
-        try term_state.dumpScreen(&d.session.term, &buf.writer)
-    else
-        try term_state.dumpScrollback(d.gpa, &d.session.term, tail, &buf.writer);
+    try d.session.dump(&buf.writer, if (mode == 1) .screen else .{ .scrollback = tail });
     try queueChunked(c, .data, buf.writer.buffered(), data_chunk);
     // follow: receive live .output going forward instead of an .eof.
     if (mode == 2) c.wants_output = true else try c.framer.queue(.eof, "");
@@ -924,23 +893,24 @@ fn handleInfo(d: *Daemon, c: *Client) !void {
         n_clients += 1;
     };
 
+    const st = d.session.state();
     var buf: std.Io.Writer.Allocating = .init(d.gpa);
     defer buf.deinit();
     try std.json.Stringify.value(.{
         .name = d.name,
         .pid = @as(i32, @intCast(std.c.getpid())),
         .shell_pid = d.shell_pid,
-        .shell = @tagName(d.session.topShell()),
-        .hooked = d.session.topHooked(),
-        .has_gunzip = d.session.topHasGunzip(),
-        .cmd_running = d.session.topCmdRunning(),
-        .depth = d.session.layers.len,
-        .alt_screen = d.session.isAltScreen(),
-        .mouse_tracking = d.session.mouseTracking(),
-        .osc133 = d.session.osc133Seen(),
-        .title = d.session.title(),
-        .last_exit = d.session.last_exit,
-        .cwd = d.session.lastCwd(),
+        .shell = @tagName(st.shell),
+        .hooked = st.hooked,
+        .has_gunzip = st.has_gunzip,
+        .cmd_running = st.cmd_running,
+        .depth = st.depth,
+        .alt_screen = st.alt_screen,
+        .mouse_tracking = st.mouse_tracking,
+        .osc133 = st.osc133_seen,
+        .title = st.title,
+        .last_exit = st.last_exit,
+        .cwd = st.cwd,
         .clients = n_clients,
         .created = d.created_ts,
     }, .{}, &buf.writer);
@@ -959,9 +929,10 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
     // All modes (including local-FS) require an idle hooked prompt: the PTY
     // path types the opener; local-FS resolves relative paths against
     // lastCwd (stale while a `cd` is mid-run) and types a trace marker.
-    if (d.session.run_queue.items.len > 0)
+    const st = d.session.state();
+    if (!st.idle)
         return queueErr(c, "write: session busy", .{});
-    if (!d.session.canType() or !d.session.topHooked())
+    if (!st.hooked or st.alt_screen)
         return queueErr(c, "write: session not ready", .{});
 
     // Local-FS shortcut: at depth 0 the daemon and shell share a filesystem
@@ -971,8 +942,8 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
     // (the daemon's may be stale). `$` is a literal byte everywhere — the
     // PTY opener single-quotes the path, so variable expansion never worked
     // there either.
-    if (d.session.layers.len == 1 and posix.getenv("ZMYTH_WRITE_FORCE_PTY") == null) {
-        if (writeLocalPath(d.gpa, path, d.session.lastCwd())) |abs| {
+    if (st.depth == 1 and posix.getenv("ZMYTH_WRITE_FORCE_PTY") == null) {
+        if (writeLocalPath(d.gpa, path, st.cwd)) |abs| {
             const fd = posix.open(abs, .{
                 .ACCMODE = .WRONLY,
                 .CREAT = true,
@@ -991,7 +962,7 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
     // Tell the client whether the layer can gunzip; client decides 'z'/'p'
     // (it may pick 'p' even when offered 'z' if the data didn't compress)
     // and reports back via `.write_begin` with the actual encoded length.
-    try c.framer.queue(.ack, if (d.session.topHasGunzip()) "z" else "p");
+    try c.framer.queue(.ack, if (st.has_gunzip) "z" else "p");
 }
 
 /// Resolve `path` to an absolute path the daemon can open directly, or null
@@ -1010,16 +981,16 @@ fn handleWriteBegin(d: *Daemon, c: *Client, payload: []const u8) !void {
     const gzip = payload[0] == 'z';
     const enc_len = std.mem.readInt(u64, payload[1..9], .little);
 
-    const opener = try shell.writeOpener(d.gpa, d.session.topShell(), w.path, enc_len, gzip);
+    const opener = try shell.writeOpener(d.gpa, d.session.state().shell, w.path, enc_len, gzip);
     defer d.gpa.free(opener);
-    try d.session.queueSend(opener);
+    try d.session.send(opener);
 
     // Defer the ack until `preexec` arrives. The line editor over-reads
     // whatever is in the kernel PTY buffer when it accepts the command, so
     // body bytes written before that are eaten. preexec is the positive
     // signal that the editor has handed the tty to head.
     w.begun = true;
-    w.preexec_at_begin = d.session.preexec_count;
+    w.preexec_at_begin = d.session.state().preexec_gen;
     w.ack_pending = true;
 }
 
@@ -1043,7 +1014,7 @@ fn typeTrace(d: *Daemon, n: u64, path: []const u8) !void {
     defer d.gpa.free(msg);
     const trace = try shell.wrapPaste(d.gpa, msg);
     defer d.gpa.free(trace);
-    try d.session.queueSend(trace);
+    try d.session.send(trace);
 }
 
 fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
@@ -1069,10 +1040,10 @@ fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
         try c.framer.queue(.ack, "");
         return;
     }
-    try d.session.queueSend(payload);
+    try d.session.send(payload);
     // Per-chunk ack is the backpressure signal: deferred while pty_input is
     // backed up so the client (which blocks on recv) can't outrun the PTY.
-    if (d.session.pendingPtyInput().len < write_backpressure)
+    if (d.session.pendingInput().len < write_backpressure)
         try c.framer.queue(.ack, "")
     else
         w.ack_pending = true;
@@ -1085,8 +1056,8 @@ fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
 fn releaseWriteAck(d: *Daemon) void {
     const w = if (d.write) |*w| w else return;
     if (!w.ack_pending) return;
-    if (d.session.preexec_count == w.preexec_at_begin) return;
-    if (d.session.pendingPtyInput().len >= write_backpressure) return;
+    if (d.session.state().preexec_gen == w.preexec_at_begin) return;
+    if (d.session.pendingInput().len >= write_backpressure) return;
     w.ack_pending = false;
     if (d.findClient(w.client_id)) |wc| queueOrClose(wc, .ack, "");
 }

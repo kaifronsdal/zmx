@@ -70,18 +70,7 @@ pub const RunDoneWire = extern struct {
     _pad: [3]u8 = .{ 0, 0, 0 },
     dur_ms: u64,
 
-    pub const Via = enum(u8) {
-        osc_done = 0,
-        prompt_fallback = 1,
-        pty_eof = 2,
-        line_rejected = 3,
-        /// `run -i`: a nested prompt appeared (via ?2004h or a new-pid `done`).
-        at_prompt = 4,
-        /// The layer this run was typed into exited (e.g. ssh dropped) before
-        /// the run's own `done` arrived. exit_code is the parent's `done` ec.
-        layer_exited = 5,
-        _,
-    };
+    pub const Via = @import("session.zig").Via;
     pub const null_exit: i32 = std.math.minInt(i32);
 
     pub fn exitCode(self: RunDoneWire) ?i32 {
