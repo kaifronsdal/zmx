@@ -438,6 +438,15 @@ fn runLoop(d: *Daemon) !void {
         d.session.tick(now);
         routeEvents(d);
 
+        // Opportunistic drain: anything queued this tick (`.output` from
+        // servicePty, replies from dispatch, `.run_done` from routeEvents)
+        // leaves this tick instead of waiting for next-tick POLLOUT. The
+        // POLLOUT path is only armed when `hasPendingWrite()` was true at
+        // the *start* of the tick, so without this a frame queued mid-tick
+        // sits one full poll iteration. Same accounting path as POLLOUT
+        // (last_drain_ns, EPIPE→closed) so no new failure modes.
+        for (d.clients.items) |*c| if (!c.closed) flushClient(c, now);
+
         reapChildren(d);
         reapClosedClients(d, now);
         assessClients(d, now);
