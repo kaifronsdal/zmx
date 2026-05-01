@@ -89,6 +89,45 @@ fn connect(allocator: Allocator, name: []const u8) !posix.fd_t {
 
 const connectOrCreate = daemon.ensure;
 
+/// Blocking connection wrapper: owns the recv scratch buffer (so callers
+/// don't `defer free` per message) and does the `.hello` handshake.
+const Conn = struct {
+    gpa: Allocator,
+    fd: posix.fd_t,
+    scratch: std.ArrayList(u8) = .empty,
+
+    /// Take ownership of `fd`, perform the version handshake. Closes `fd`
+    /// on failure.
+    fn open(gpa: Allocator, fd: posix.fd_t) !Conn {
+        var c: Conn = .{ .gpa = gpa, .fd = fd };
+        errdefer c.close();
+        if (try ipc.handshake(gpa, fd, &c.scratch)) |peer_ver| {
+            errf(
+                "zmyth: protocol mismatch (client v{d}, daemon v{d}); " ++
+                    "a stale daemon is running — `zmyth kill -9 <name>` and retry\n",
+                .{ ipc.proto_version, peer_ver },
+            );
+            return error.ProtocolMismatch;
+        }
+        return c;
+    }
+
+    fn close(c: *Conn) void {
+        c.scratch.deinit(c.gpa);
+        posix.close(c.fd);
+    }
+
+    fn send(c: *Conn, msg: ipc.Msg) !void {
+        return ipc.sendBlocking(c.gpa, c.fd, msg);
+    }
+
+    /// Slices in the returned `Msg` borrow `c.scratch`; valid until the
+    /// next `recv()`.
+    fn recv(c: *Conn) !ipc.Msg {
+        return ipc.recvBlocking(c.gpa, c.fd, &c.scratch);
+    }
+};
+
 // ---- glob resolution -----------------------------------------------------
 
 fn hasGlobChars(s: []const u8) bool {
@@ -182,12 +221,15 @@ fn probeAll(allocator: Allocator, names: []const []const u8) ![]Probe {
         // Bound the wait so a wedged daemon can't hang `ls`.
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&recv_to)) catch {};
 
-        ipc.sendBlocking(fd, .info, "") catch continue;
-        // WouldBlock (RCVTIMEO expiry) or any other error -> no info.
-        const msg = ipc.recvBlocking(allocator, fd) catch continue;
-        defer allocator.free(msg.payload);
-        if (msg.tag == .info_reply) {
-            p.info = std.json.parseFromSlice(std.json.Value, allocator, msg.payload, .{}) catch null;
+        var scr: std.ArrayList(u8) = .empty;
+        defer scr.deinit(allocator);
+        // Handshake + info. Any failure (timeout, version mismatch, decode)
+        // leaves info=null → shown as stale in `ls`.
+        if (ipc.handshake(allocator, fd, &scr) catch continue) |_| continue;
+        ipc.sendBlocking(allocator, fd, .info) catch continue;
+        const msg = ipc.recvBlocking(allocator, fd, &scr) catch continue;
+        if (msg == .info_reply) {
+            p.info = std.json.parseFromSlice(std.json.Value, allocator, msg.info_reply, .{}) catch null;
         }
     }
     return probes;
@@ -254,17 +296,9 @@ fn installSignals() !posix.sigset_t {
 
 // ---- wire payload encoders ----------------------------------------------
 
-fn encodeWinsize(buf: *[4]u8, ws: pty.Winsize) void {
-    std.mem.writeInt(u16, buf[0..2], ws.cols, .little);
-    std.mem.writeInt(u16, buf[2..4], ws.rows, .little);
-}
-
-fn buildAttachPayload(allocator: Allocator, ws: pty.Winsize) ![]u8 {
+fn buildAttachEnv(allocator: Allocator) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    var sz: [4]u8 = undefined;
-    encodeWinsize(&sz, ws);
-    try buf.appendSlice(allocator, &sz);
     for (env_forward) |key| {
         if (posix.getenv(key)) |val| {
             try buf.appendSlice(allocator, key);
@@ -335,7 +369,15 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
         attach_tty.alt_screen_fd = null;
     };
 
-    // Make socket nonblocking for the Framer-driven pump.
+    // Handshake while still blocking, then nonblocking for the Framer pump.
+    {
+        var scr: std.ArrayList(u8) = .empty;
+        defer scr.deinit(allocator);
+        if (try ipc.handshake(allocator, sock, &scr)) |peer| {
+            errf("zmyth: attach: protocol v{d} ≠ daemon v{d}; kill the stale daemon\n", .{ ipc.proto_version, peer });
+            return 1;
+        }
+    }
     try lib.posix.setNonBlock(sock, true);
 
     var framer = ipc.Framer.init(allocator);
@@ -343,9 +385,9 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
 
     const ws = pty.getWinsize(stdout_fd) catch pty.Winsize{ .rows = 24, .cols = 80 };
     {
-        const payload = try buildAttachPayload(allocator, ws);
-        defer allocator.free(payload);
-        try framer.queue(.attach, payload);
+        const env = try buildAttachEnv(allocator);
+        defer allocator.free(env);
+        try framer.queue(.{ .attach = .{ .cols = ws.cols, .rows = ws.rows, .env = env } });
     }
 
     var pfds = [_]posix.pollfd{
@@ -357,9 +399,7 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
     while (true) {
         if (sigwinch_flag.swap(false, .acq_rel)) {
             const nws = pty.getWinsize(stdout_fd) catch ws;
-            var sz: [4]u8 = undefined;
-            encodeWinsize(&sz, nws);
-            try framer.queue(.resize, &sz);
+            try framer.queue(.{ .resize = .{ .cols = nws.cols, .rows = nws.rows } });
         }
 
         pfds[1].events = posix.POLL.IN;
@@ -377,10 +417,10 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
         if (pfds[0].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
             const n = posix.read(stdin_fd, &rbuf) catch 0;
             if (n == 0) {
-                try framer.queue(.detach, "");
+                try framer.queue(.detach);
                 pfds[0].fd = -1; // stop polling stdin
             } else {
-                try framer.queue(.input, rbuf[0..n]);
+                try framer.queue(.{ .input = rbuf[0..n] });
             }
         }
 
@@ -411,14 +451,14 @@ pub fn attach(allocator: Allocator, args: []const [:0]const u8) !u8 {
                 return 1;
             }
             try framer.pushRead(rbuf[0..n]);
-            while (try framer.next()) |msg| switch (msg.tag) {
-                .output, .state => try writeAllFd(stdout_fd, msg.payload),
+            while (try framer.next()) |msg| switch (msg) {
+                .output, .state => |b| try writeAllFd(stdout_fd, b),
                 .ack => return 0, // detach acked
                 .eof => {
                     errf("\r\n[session exited]\r\n", .{});
                     return 0;
                 },
-                .err => errf("\r\nzmyth: {s}\r\n", .{msg.payload}),
+                .err => |e| errf("\r\nzmyth: {s}\r\n", .{e}),
                 else => {},
             };
         }
@@ -462,28 +502,22 @@ pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
         errf("zmyth: run: {s}\n", .{@errorName(err)});
         return 1;
     };
-    defer posix.close(sock);
+    var conn = Conn.open(allocator, sock) catch return 1;
+    defer conn.close();
 
-    // Wire payload: 1-byte interactive flag + cmd.
-    const payload = try allocator.alloc(u8, cmd.len + 1);
-    defer allocator.free(payload);
-    payload[0] = if (interactive) 1 else 0;
-    @memcpy(payload[1..], cmd);
-    try ipc.sendBlocking(sock, .run, payload);
+    try conn.send(.{ .run = .{ .interactive = interactive, .cmd = cmd } });
     if (detach_mode) return 0;
 
     var got_err = false;
     while (true) {
-        const msg = ipc.recvBlocking(allocator, sock) catch |err| switch (err) {
+        const msg = conn.recv() catch |err| switch (err) {
             error.UnexpectedEof => return 1,
             else => return err,
         };
-        defer allocator.free(msg.payload);
-        switch (msg.tag) {
-            .output => try writeAllFd(posix.STDOUT_FILENO, msg.payload),
-            .run_done => {
-                const rd = ipc.RunDoneWire.decode(msg.payload) orelse return 1;
-                const ec = rd.exitCode();
+        switch (msg) {
+            .output => |b| try writeAllFd(posix.STDOUT_FILENO, b),
+            .run_done => |rd| {
+                const ec = rd.ec();
                 // line_rejected/prompt_fallback have no exit code; without -j
                 // the only signal is the 125 return — say why.
                 if (ec == null and !json_out) switch (rd.via) {
@@ -499,7 +533,7 @@ pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
                     else => {},
                 };
                 if (json_out) {
-                    const via_s = std.enums.tagName(ipc.RunDoneWire.Via, rd.via) orelse "unknown";
+                    const via_s = std.enums.tagName(ipc.Via, rd.via) orelse "unknown";
                     // Leading \n: ensure JSON is on its own line after PTY output.
                     if (ec) |e| try outf(
                         "\n{{\"exit_code\":{d},\"via\":\"{s}\",\"dur_ms\":{d}}}\n",
@@ -515,8 +549,8 @@ pub fn run(allocator: Allocator, args: []const [:0]const u8) !u8 {
             // prompt"). Print it but keep waiting; only `.run_done`/`.eof`
             // are terminal. We do remember that an error was reported so
             // a fatal `.err` followed by socket close still exits non-zero.
-            .err => {
-                errf("zmyth: run: {s}\n", .{msg.payload});
+            .err => |e| {
+                errf("zmyth: run: {s}\n", .{e});
                 got_err = true;
             },
             .eof => return if (got_err) 1 else 0,
@@ -546,25 +580,25 @@ pub fn hook(allocator: Allocator, args: []const [:0]const u8) !u8 {
     if (validateNameOrFail(name, "hook")) |rc| return rc;
 
     const sock = connectOrFail(allocator, name, "hook") orelse return 1;
-    defer posix.close(sock);
-    try ipc.sendBlocking(sock, .hook, "");
+    var conn = Conn.open(allocator, sock) catch return 1;
+    defer conn.close();
+    try conn.send(.hook);
 
     while (true) {
-        const msg = ipc.recvBlocking(allocator, sock) catch |err| switch (err) {
+        const msg = conn.recv() catch |err| switch (err) {
             error.UnexpectedEof => {
                 errf("zmyth: hook: daemon closed connection\n", .{});
                 return 1;
             },
             else => return err,
         };
-        defer allocator.free(msg.payload);
-        switch (msg.tag) {
-            .ack => {
-                try outf("zmyth: {s}\n", .{msg.payload});
+        switch (msg) {
+            .ack => |m| {
+                try outf("zmyth: {s}\n", .{m});
                 return 0;
             },
-            .err => {
-                errf("zmyth: {s}\n", .{msg.payload});
+            .err => |m| {
+                errf("zmyth: {s}\n", .{m});
                 return 1;
             },
             .eof => return 1,
@@ -603,11 +637,10 @@ pub fn send(allocator: Allocator, args: []const [:0]const u8) !u8 {
     }
 
     const sock = connectOrFail(allocator, name, "send") orelse return 1;
-    defer posix.close(sock);
-    try ipc.sendBlocking(sock, .send, bytes);
-    const ack = try ipc.recvBlocking(allocator, sock);
-    allocator.free(ack.payload);
-    return if (ack.tag == .ack) 0 else 1;
+    var conn = Conn.open(allocator, sock) catch return 1;
+    defer conn.close();
+    try conn.send(.{ .send = bytes });
+    return if ((try conn.recv()) == .ack) 0 else 1;
 }
 
 pub fn read(allocator: Allocator, args: []const [:0]const u8) !u8 {
@@ -642,27 +675,27 @@ pub fn read(allocator: Allocator, args: []const [:0]const u8) !u8 {
     if (validateNameOrFail(nm, "read")) |rc| return rc;
 
     const sock = connectOrFail(allocator, nm, "read") orelse return 1;
-    defer posix.close(sock);
+    var conn = Conn.open(allocator, sock) catch return 1;
+    defer conn.close();
 
-    var payload: [5]u8 = undefined;
-    payload[0] = if (follow) 2 else if (screen) 1 else 0;
-    std.mem.writeInt(u32, payload[1..5], tail_n, .little);
-    try ipc.sendBlocking(sock, .read, &payload);
+    try conn.send(.{ .read = .{
+        .mode = if (follow) 2 else if (screen) 1 else 0,
+        .tail_n = tail_n,
+    } });
 
     while (true) {
-        const msg = ipc.recvBlocking(allocator, sock) catch |err| switch (err) {
+        const msg = conn.recv() catch |err| switch (err) {
             // A clean end arrives as an `.eof` frame; raw socket EOF without
             // one means the daemon died (or, in non-follow mode, the dump
             // completed and the daemon hung up — also fine).
             error.UnexpectedEof => return if (follow) 1 else 0,
             else => return err,
         };
-        defer allocator.free(msg.payload);
-        switch (msg.tag) {
-            .data, .output => try writeAllFd(posix.STDOUT_FILENO, msg.payload),
+        switch (msg) {
+            .data, .output => |b| try writeAllFd(posix.STDOUT_FILENO, b),
             .eof => return 0,
-            .err => {
-                errf("zmyth: read: {s}\n", .{msg.payload});
+            .err => |e| {
+                errf("zmyth: read: {s}\n", .{e});
                 return 1;
             },
             else => {},
@@ -783,11 +816,16 @@ pub fn wait(allocator: Allocator, args: []const [:0]const u8) !u8 {
             if (json_out) try outf("{{\"name\":\"{s}\",\"exit_code\":null}}\n", .{name});
             continue;
         };
-        defer posix.close(sock);
+        var conn = Conn.open(allocator, sock) catch {
+            agg = @max(agg, 1);
+            if (json_out) try outf("{{\"name\":\"{s}\",\"exit_code\":null}}\n", .{name});
+            continue;
+        };
+        defer conn.close();
 
-        try ipc.sendBlocking(sock, .wait, "");
+        try conn.send(.wait);
         while (true) {
-            const msg = ipc.recvBlocking(allocator, sock) catch |err| switch (err) {
+            const msg = conn.recv() catch |err| switch (err) {
                 // Daemon vanished without sending .run_done/.eof — treat as
                 // failure so `zmyth wait foo && deploy` doesn't proceed on a
                 // crash.
@@ -798,14 +836,13 @@ pub fn wait(allocator: Allocator, args: []const [:0]const u8) !u8 {
                 },
                 else => return err,
             };
-            defer allocator.free(msg.payload);
-            switch (msg.tag) {
-                .run_done => {
-                    if (ipc.RunDoneWire.decode(msg.payload)) |rd| ec = rd.exitCode();
+            switch (msg) {
+                .run_done => |rd| {
+                    ec = rd.ec();
                     break;
                 },
-                .err => {
-                    errf("zmyth: wait: {s}: {s}\n", .{ name, msg.payload });
+                .err => |e| {
+                    errf("zmyth: wait: {s}: {s}\n", .{ name, e });
                     agg = @max(agg, 1);
                     break;
                 },
@@ -888,22 +925,21 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
     }
 
     const sock = connectOrFail(allocator, name, "write") orelse return 1;
-    defer posix.close(sock);
+    var conn = Conn.open(allocator, sock) catch return 1;
+    defer conn.close();
 
-    try ipc.sendBlocking(sock, .write_hdr, path);
+    try conn.send(.{ .write_hdr = .{ .path = path } });
 
     // Daemon replies with the mode it can support: 'L' (local-FS direct),
     // 'z' (PTY, gunzip available), 'p' (PTY, plain only). Compression
     // happens AFTER this so local-FS pays no gzip cost.
-    const offered: u8 = blk: {
-        const reply = try ipc.recvBlocking(allocator, sock);
-        defer allocator.free(reply.payload);
-        if (reply.tag == .err) {
-            errf("zmyth: write: {s}\n", .{reply.payload});
+    const offered: u8 = switch (try conn.recv()) {
+        .err => |e| {
+            errf("zmyth: write: {s}\n", .{e});
             return 1;
-        }
-        if (reply.tag != .ack or reply.payload.len == 0) return 1;
-        break :blk reply.payload[0];
+        },
+        .ack => |a| if (a.len > 0) a[0] else return 1,
+        else => return 1,
     };
 
     var gz_buf: []const u8 = "";
@@ -918,36 +954,39 @@ pub fn write(allocator: Allocator, args: []const [:0]const u8) !u8 {
             };
             const use_gz = gz_buf.len > 0 and gz_buf.len < raw.items.len;
             const src = if (use_gz) gz_buf else raw.items;
-            var begin: [9]u8 = undefined;
-            begin[0] = if (use_gz) 'z' else 'p';
-            std.mem.writeInt(u64, begin[1..9], lib.hook.writeEncLen(src.len), .little);
-            try ipc.sendBlocking(sock, .write_begin, &begin);
-            const ack = try ipc.recvBlocking(allocator, sock);
-            defer allocator.free(ack.payload);
-            if (ack.tag != .ack) {
-                if (ack.tag == .err) errf("zmyth: write: {s}\n", .{ack.payload});
-                return 1;
+            try conn.send(.{ .write_begin = .{
+                .mode = if (use_gz) 'z' else 'p',
+                .enc_len = lib.hook.writeEncLen(src.len),
+            } });
+            switch (try conn.recv()) {
+                .ack => {},
+                .err => |e| {
+                    errf("zmyth: write: {s}\n", .{e});
+                    return 1;
+                },
+                else => return 1,
             }
             break :blk .{ src, true };
         },
         else => return 1,
     };
-    try writeStream(allocator, sock, body, b64);
+    try writeStream(&conn, body, b64);
 
-    try ipc.sendBlocking(sock, .write_data, "");
-    const reply = try ipc.recvBlocking(allocator, sock);
-    defer allocator.free(reply.payload);
-    if (reply.tag == .err) {
-        errf("zmyth: write: {s}\n", .{reply.payload});
-        return 1;
+    try conn.send(.{ .write_data = "" });
+    switch (try conn.recv()) {
+        .ack => return 0,
+        .err => |e| {
+            errf("zmyth: write: {s}\n", .{e});
+            return 1;
+        },
+        else => return 1,
     }
-    return if (reply.tag == .ack) 0 else 1;
 }
 
 /// Send `body` as `.write_data` chunks (raw or base64-encoded), waiting for
 /// `.ack` after each. 48 raw → 64 enc + '\n' per line; mid-stream chunks are
 /// 48-aligned so `=` padding appears only at EOF.
-fn writeStream(allocator: Allocator, sock: posix.fd_t, body: []const u8, b64: bool) !void {
+fn writeStream(conn: *Conn, body: []const u8, b64: bool) !void {
     var enc: [65 * 1024]u8 = undefined;
     var pos: usize = 0;
     while (pos < body.len) {
@@ -965,12 +1004,14 @@ fn writeStream(allocator: Allocator, sock: posix.fd_t, body: []const u8, b64: bo
             }
             break :blk enc[0..w];
         };
-        try ipc.sendBlocking(sock, .write_data, wire);
-        const ack = try ipc.recvBlocking(allocator, sock);
-        defer allocator.free(ack.payload);
-        if (ack.tag != .ack) {
-            if (ack.tag == .err) errf("zmyth: write: {s}\n", .{ack.payload});
-            return error.WriteFailed;
+        try conn.send(.{ .write_data = wire });
+        switch (try conn.recv()) {
+            .ack => {},
+            .err => |e| {
+                errf("zmyth: write: {s}\n", .{e});
+                return error.WriteFailed;
+            },
+            else => return error.WriteFailed,
         }
     }
 }
@@ -1019,16 +1060,20 @@ pub fn kill(allocator: Allocator, args: []const [:0]const u8) !u8 {
                 continue;
             },
         };
-        defer posix.close(sock);
         // Daemon may already be tearing down (race with another kill / shell
-        // exit); treat a broken pipe like the recv side does and move on.
-        ipc.sendBlocking(sock, .kill, &.{sig}) catch |err| {
+        // exit); treat any failure as "already gone" and move on. Skip the
+        // version handshake so `kill -9` can take down a stale-version daemon.
+        var scr: std.ArrayList(u8) = .empty;
+        defer scr.deinit(allocator);
+        defer posix.close(sock);
+        ipc.sendBlocking(allocator, sock, .{ .hello = .{ .ver = ipc.proto_version } }) catch continue;
+        _ = ipc.recvBlocking(allocator, sock, &scr) catch {};
+        ipc.sendBlocking(allocator, sock, .{ .kill = .{ .sig = sig } }) catch |err| {
             errf("zmyth: kill: {s}: {s}\n", .{ name, @errorName(err) });
             rc = 1;
             continue;
         };
-        const ack = ipc.recvBlocking(allocator, sock) catch continue;
-        allocator.free(ack.payload);
+        _ = ipc.recvBlocking(allocator, sock, &scr) catch continue;
     }
     return rc;
 }
@@ -1040,8 +1085,9 @@ pub fn detach(allocator: Allocator, args: []const [:0]const u8) !u8 {
     };
     if (validateNameOrFail(name, "detach")) |rc| return rc;
     const sock = connectOrFail(allocator, name, "detach") orelse return 1;
-    defer posix.close(sock);
-    try ipc.sendBlocking(sock, .detach, "");
+    var conn = Conn.open(allocator, sock) catch return 1;
+    defer conn.close();
+    try conn.send(.detach);
     return 0;
 }
 
@@ -1081,15 +1127,6 @@ test "hasGlobChars" {
     try testing.expect(hasGlobChars("foo*"));
     try testing.expect(hasGlobChars("a?b"));
     try testing.expect(!hasGlobChars("plain"));
-}
-
-test "encodeWinsize little-endian" {
-    var b: [4]u8 = undefined;
-    encodeWinsize(&b, .{ .cols = 0x1234, .rows = 0x5678 });
-    try testing.expectEqual(@as(u8, 0x34), b[0]);
-    try testing.expectEqual(@as(u8, 0x12), b[1]);
-    try testing.expectEqual(@as(u8, 0x78), b[2]);
-    try testing.expectEqual(@as(u8, 0x56), b[3]);
 }
 
 test {

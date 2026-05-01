@@ -162,6 +162,9 @@ const Client = struct {
     id: u32,
     framer: ipc.Framer,
     input_cls: lib.Classifier,
+    /// Sent a matching `.hello` (first frame). Until then, only `.hello`
+    /// is accepted; a mismatch closes the connection.
+    greeted: bool = false,
     /// Sent `.attach` (vs. one-shot `.run`/`.read`).
     attached: bool = false,
     /// Wants live `.output` frames (set on `.attach` and `.run`).
@@ -465,7 +468,7 @@ fn assessClients(d: *Daemon, now: i128) void {
         const stalled = c.stalled(now);
         if (stalled and c.framer.pendingWrite().len > client_drop_backlog) {
             log.warn("client {d} stalled with >{d}MiB backlog; dropping", .{ c.id, client_drop_backlog >> 20 });
-            queueOrClose(c, .err, "output backlog exceeded; detaching");
+            queueOrClose(c, .{ .err = "output backlog exceeded; detaching" });
             c.closed = true;
             continue;
         }
@@ -528,7 +531,7 @@ fn servicePty(d: *Daemon, re: i16, read_buf: []u8, now: i128) !bool {
     // Broadcast to clients that want live output. Health (stall/demote) is
     // assessed once per loop tick in assessClients, not here.
     for (d.clients.items) |*c| {
-        if (c.wants_output and !c.closed) queueOrClose(c, .output, data);
+        if (c.wants_output and !c.closed) queueOrClose(c, .{ .output = data });
     }
     routeEvents(d);
     return false;
@@ -548,13 +551,14 @@ fn serviceClient(d: *Daemon, c: *Client, re: i16, read_buf: []u8, now: i128) voi
                     c.closed = true;
                     return;
                 };
-                while (c.framer.next() catch blk: {
+                while (c.framer.next() catch |e| blk: {
+                    log.warn("client {d} decode: {s}", .{ c.id, @errorName(e) });
                     c.closed = true;
                     break :blk null;
                 }) |msg| {
                     dispatch(d, c, msg, now) catch |err| {
-                        log.warn("dispatch tag={d} client={d}: {s}", .{
-                            @intFromEnum(msg.tag), c.id, @errorName(err),
+                        log.warn("dispatch {s} client={d}: {s}", .{
+                            @tagName(msg.tag()), c.id, @errorName(err),
                         });
                         // Client is blocked expecting a reply; surface the
                         // failure and hang up so it doesn't wait forever.
@@ -623,7 +627,7 @@ fn handlePtyEof(d: *Daemon, now: i128) void {
     drainWaiters(d);
     for (d.clients.items) |*c| {
         if (!c.closed) {
-            c.framer.queue(.eof, "") catch {};
+            c.framer.queue(.eof) catch {};
             flushClient(c, 0);
         }
     }
@@ -636,47 +640,45 @@ fn routeEvents(d: *Daemon) void {
         if (c.closed) continue;
         switch (ev) {
             .run_done => |rd| {
-                const wire: ipc.RunDoneWire = .{
-                    .exit_code = rd.exit_code orelse ipc.RunDoneWire.null_exit,
+                queueOrClose(c, .{ .run_done = .{
+                    .exit_code = rd.exit_code orelse ipc.null_exit,
                     .via = rd.via,
                     .dur_ms = rd.dur_ms,
-                };
-                queueOrClose(c, .run_done, std.mem.asBytes(&wire));
+                } });
                 c.wants_output = false;
                 c.waiting = false;
             },
             .hook_done => |hd| switch (hd.result) {
-                .already_hooked => |v| queueOrClose(c, .ack, std.fmt.bufPrint(
+                .already_hooked => |v| queueOrClose(c, .{ .ack = std.fmt.bufPrint(
                     &b,
                     "already hooked (v{d})",
                     .{v},
-                ) catch "already hooked"),
-                .installed => |sh| queueOrClose(c, .ack, std.fmt.bufPrint(
+                ) catch "already hooked" }),
+                .installed => |sh| queueOrClose(c, .{ .ack = std.fmt.bufPrint(
                     &b,
                     "installed → {s}/hook.{s}",
                     .{ hook.dir, @tagName(sh) },
-                ) catch "installed"),
-                .err => |e| queueOrClose(c, .err, e),
+                ) catch "installed" }),
+                .err => |e| queueOrClose(c, .{ .err = e }),
             },
-            .warn => |w| queueErr(c, "{s}", .{w.msg}) catch {},
+            .warn => |w| queueOrClose(c, .{ .err = w.msg }),
         }
     }
     // Any transition to idle releases blocked waiters.
     if (d.session.state().idle) drainWaiters(d);
 }
 
-fn waitReplyWire(d: *Daemon) ipc.RunDoneWire {
-    return .{
-        .exit_code = d.session.state().last_exit orelse ipc.RunDoneWire.null_exit,
+fn waitReply(d: *Daemon) ipc.Msg {
+    return .{ .run_done = .{
+        .exit_code = d.session.state().last_exit orelse ipc.null_exit,
         .via = .osc_done,
         .dur_ms = 0,
-    };
+    } };
 }
 
 fn drainWaiters(d: *Daemon) void {
-    const wire = waitReplyWire(d);
     for (d.clients.items) |*c| if (c.waiting and !c.closed) {
-        queueOrClose(c, .run_done, std.mem.asBytes(&wire));
+        queueOrClose(c, waitReply(d));
         c.waiting = false;
     };
 }
@@ -746,12 +748,37 @@ fn acceptClient(d: *Daemon, now: i128) !void {
 
 // ───────────────────────────── dispatch ─────────────────────────────
 
-fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message, now: i128) !void {
-    switch (msg.tag) {
-        .attach => try handleAttach(d, c, msg.payload),
-        .input => try handleInput(d, c, msg.payload),
-        .resize => try handleResize(d, c, msg.payload),
-        .run => {
+fn dispatch(d: *Daemon, c: *Client, msg: ipc.Msg, now: i128) !void {
+    if (!c.greeted) {
+        switch (msg) {
+            .hello => |h| if (h.ver == ipc.proto_version) {
+                c.greeted = true;
+                try c.framer.queue(.{ .hello = .{ .ver = ipc.proto_version } });
+            } else {
+                try queueErr(
+                    c,
+                    "protocol v{d} ≠ daemon v{d}; kill the stale daemon (`zmyth kill -9 {s}`)",
+                    .{ h.ver, ipc.proto_version, d.name },
+                );
+                c.closed = true;
+            },
+            else => {
+                try queueErr(c, "expected .hello, got .{s}", .{@tagName(msg.tag())});
+                c.closed = true;
+            },
+        }
+        return;
+    }
+    switch (msg) {
+        .hello => try queueErr(c, "duplicate .hello", .{}),
+        .attach => |a| try handleAttach(d, c, a),
+        .input => |b| try handleInput(d, c, b),
+        .resize => |r| {
+            c.cols = r.cols;
+            c.rows = r.rows;
+            if (d.leader_id == c.id) d.promoteLeader(c);
+        },
+        .run => |r| {
             if (d.write != null) {
                 return queueErr(c, "run: write in progress", .{});
             }
@@ -765,43 +792,36 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message, now: i128) !void {
                         "(unsupported $SHELL); use `attach` or `send`",
                     .{},
                 );
-                const w: ipc.RunDoneWire = .{
-                    .exit_code = ipc.RunDoneWire.null_exit,
+                try c.framer.queue(.{ .run_done = .{
+                    .exit_code = ipc.null_exit,
                     .via = .prompt_fallback,
                     .dur_ms = 0,
-                };
-                try c.framer.queue(.run_done, std.mem.asBytes(&w));
+                } });
                 return;
             }
-            // First payload byte: 0 = normal, 1 = `-i`.
-            const interactive = msg.payload.len > 0 and msg.payload[0] == 1;
-            const cmd = if (msg.payload.len > 0) msg.payload[1..] else msg.payload;
             c.wants_output = true;
-            try d.session.run(c.id, cmd, .{ .interactive = interactive }, now);
+            try d.session.run(c.id, r.cmd, .{ .interactive = r.interactive }, now);
         },
-        .send => {
+        .send => |b| {
             if (d.write) |w| if (w.begun)
                 return queueErr(c, "send: write in progress", .{});
-            try d.session.send(msg.payload);
-            try c.framer.queue(.ack, "");
+            try d.session.send(b);
+            try c.framer.queue(.{ .ack = "" });
         },
-        .read => try handleRead(d, c, msg.payload),
+        .read => |r| try handleRead(d, c, r),
         .info => try handleInfo(d, c),
         .wait => {
-            if (d.session.state().idle) {
-                const wire = waitReplyWire(d);
-                try c.framer.queue(.run_done, std.mem.asBytes(&wire));
-            } else {
+            if (d.session.state().idle)
+                try c.framer.queue(waitReply(d))
+            else
                 c.waiting = true;
-            }
         },
-        .write_hdr => try handleWriteHdr(d, c, msg.payload),
-        .write_begin => try handleWriteBegin(d, c, msg.payload),
-        .write_data => try handleWriteData(d, c, msg.payload),
-        .kill => {
-            const sig: u8 = if (msg.payload.len >= 1) msg.payload[0] else @intCast(posix.SIG.TERM);
-            try c.framer.queue(.ack, "");
-            if (sig == posix.SIG.KILL) {
+        .write_hdr => |w| try handleWriteHdr(d, c, w.path),
+        .write_begin => |w| try handleWriteBegin(d, c, w),
+        .write_data => |b| try handleWriteData(d, c, b),
+        .kill => |k| {
+            try c.framer.queue(.{ .ack = "" });
+            if (k.sig == posix.SIG.KILL) {
                 posix.kill(d.shell_pid, posix.SIG.KILL) catch {};
             }
             // Interactive shells ignore SIGTERM; let the shutdown path do
@@ -812,26 +832,28 @@ fn dispatch(d: *Daemon, c: *Client, msg: ipc.Message, now: i128) !void {
             if (d.write) |w| if (w.begun)
                 return queueErr(c, "hook: write in progress", .{});
             if (try d.session.installHook(c.id, now)) |refusal| {
-                try c.framer.queue(.err, refusal);
+                try c.framer.queue(.{ .err = refusal });
             }
             // else: probe queued; result arrives via routeEvents.
         },
         .detach => {
-            try c.framer.queue(.ack, "");
-            // detach all attached clients (leader + followers); payload unused.
+            try c.framer.queue(.{ .ack = "" });
+            // detach all attached clients (leader + followers).
             for (d.clients.items) |*oc| if (oc.attached) {
                 oc.closed = true;
             };
             c.closed = true;
         },
-        else => try queueErr(c, "unknown tag {d}", .{@intFromEnum(msg.tag)}),
+        // d→c tags arriving from a client are a protocol error.
+        .output, .state, .run_done, .info_reply, .data, .ack, .err, .eof => {
+            try queueErr(c, "unexpected tag .{s}", .{@tagName(msg.tag())});
+        },
     }
 }
 
-fn handleAttach(d: *Daemon, c: *Client, payload: []const u8) !void {
-    if (payload.len < 4) return queueErr(c, "attach: short payload", .{});
-    c.cols = std.mem.readInt(u16, payload[0..2], .little);
-    c.rows = std.mem.readInt(u16, payload[2..4], .little);
+fn handleAttach(d: *Daemon, c: *Client, a: @FieldType(ipc.Msg, "attach")) !void {
+    c.cols = a.cols;
+    c.rows = a.rows;
     c.attached = true;
     c.wants_output = true;
     // The freshest attach is overwhelmingly the terminal a human is looking
@@ -841,7 +863,7 @@ fn handleAttach(d: *Daemon, c: *Client, payload: []const u8) !void {
     d.promoteLeader(c);
 
     // Env refresh (#104): KEY=VAL\0KEY=VAL\0...
-    spawn.refreshEnvLinks(d.sp.env_dir, payload[4..]) catch |err| {
+    spawn.refreshEnvLinks(d.sp.env_dir, a.env) catch |err| {
         log.warn("env refresh: {s}", .{@errorName(err)});
     };
 
@@ -855,7 +877,7 @@ fn handleAttach(d: *Daemon, c: *Client, payload: []const u8) !void {
 fn handleInput(d: *Daemon, c: *Client, payload: []const u8) !void {
     const r = c.input_cls.feed(payload);
     if (r.detach) {
-        try c.framer.queue(.ack, "");
+        try c.framer.queue(.{ .ack = "" });
         c.closed = true;
         return;
     }
@@ -873,28 +895,14 @@ fn handleInput(d: *Daemon, c: *Client, payload: []const u8) !void {
     try d.session.send(payload);
 }
 
-fn handleResize(d: *Daemon, c: *Client, payload: []const u8) !void {
-    if (payload.len < 4) return queueErr(c, "resize: short payload", .{});
-    c.cols = std.mem.readInt(u16, payload[0..2], .little);
-    c.rows = std.mem.readInt(u16, payload[2..4], .little);
-    // Same best-effort swallow as promoteLeader: a ghostty resize OOM
-    // shouldn't drop the client (the PTY ioctl almost never fails).
-    if (d.leader_id == c.id) d.promoteLeader(c);
-}
-
-fn handleRead(d: *Daemon, c: *Client, payload: []const u8) !void {
-    if (payload.len < 5) return queueErr(c, "read: short payload", .{});
-    const mode = payload[0];
-    const tail_n = std.mem.readInt(u32, payload[1..5], .little);
-    const tail: ?usize = if (tail_n == 0) null else tail_n;
-
+fn handleRead(d: *Daemon, c: *Client, r: @FieldType(ipc.Msg, "read")) !void {
+    const tail: ?usize = if (r.tail_n == 0) null else r.tail_n;
     var buf: std.Io.Writer.Allocating = .init(d.gpa);
     defer buf.deinit();
-
-    try d.session.dump(&buf.writer, if (mode == 1) .screen else .{ .scrollback = tail });
+    try d.session.dump(&buf.writer, if (r.mode == 1) .screen else .{ .scrollback = tail });
     try queueChunked(c, .data, buf.writer.buffered(), data_chunk);
     // follow: receive live .output going forward instead of an .eof.
-    if (mode == 2) c.wants_output = true else try c.framer.queue(.eof, "");
+    if (r.mode == 2) c.wants_output = true else try c.framer.queue(.eof);
 }
 
 fn handleInfo(d: *Daemon, c: *Client) !void {
@@ -925,7 +933,7 @@ fn handleInfo(d: *Daemon, c: *Client) !void {
         .created = d.created_ts,
     }, .{}, &buf.writer);
 
-    try c.framer.queue(.info_reply, buf.writer.buffered());
+    try c.framer.queue(.{ .info_reply = buf.writer.buffered() });
 }
 
 fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
@@ -963,7 +971,7 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
                 return queueErr(c, "write: open: {s}", .{@errorName(e)});
             };
             d.write = .{ .client_id = c.id, .path = abs, .local_fd = fd };
-            try c.framer.queue(.ack, "L");
+            try c.framer.queue(.{ .ack = "L" });
             return;
         }
     }
@@ -972,7 +980,7 @@ fn handleWriteHdr(d: *Daemon, c: *Client, path: []const u8) !void {
     // Tell the client whether the layer can gunzip; client decides 'z'/'p'
     // (it may pick 'p' even when offered 'z' if the data didn't compress)
     // and reports back via `.write_begin` with the actual encoded length.
-    try c.framer.queue(.ack, if (st.has_gunzip) "z" else "p");
+    try c.framer.queue(.{ .ack = if (st.has_gunzip) "z" else "p" });
 }
 
 /// Resolve `path` to an absolute path the daemon can open directly, or null
@@ -984,14 +992,12 @@ fn writeLocalPath(gpa: Allocator, path: []const u8, cwd: []const u8) ?[]u8 {
     return std.fs.path.join(gpa, &.{ cwd, path }) catch null;
 }
 
-fn handleWriteBegin(d: *Daemon, c: *Client, payload: []const u8) !void {
+fn handleWriteBegin(d: *Daemon, c: *Client, b: @FieldType(ipc.Msg, "write_begin")) !void {
     const w = if (d.write) |*w| w else return queueErr(c, "write: unexpected begin", .{});
-    if (w.client_id != c.id or w.local_fd != null or w.begun or payload.len < 9)
+    if (w.client_id != c.id or w.local_fd != null or w.begun)
         return queueErr(c, "write: unexpected begin", .{});
-    const gzip = payload[0] == 'z';
-    const enc_len = std.mem.readInt(u64, payload[1..9], .little);
 
-    const opener = try hook.writeOpener(d.gpa, d.session.state().shell, w.path, enc_len, gzip);
+    const opener = try hook.writeOpener(d.gpa, d.session.state().shell, w.path, b.enc_len, b.mode == 'z');
     defer d.gpa.free(opener);
     try d.session.send(opener);
 
@@ -1034,27 +1040,27 @@ fn handleWriteData(d: *Daemon, c: *Client, payload: []const u8) !void {
         if (payload.len == 0) {
             const n = posix.lseek_CUR_get(fd) catch 0;
             endWrite(d, n);
-            try c.framer.queue(.ack, "");
+            try c.framer.queue(.{ .ack = "" });
             return;
         }
         @import("posix/compat.zig").writeAllFd(fd, payload) catch |e| {
             endWrite(d, null);
             return queueErr(c, "write: {s}", .{@errorName(e)});
         };
-        try c.framer.queue(.ack, "");
+        try c.framer.queue(.{ .ack = "" });
         return;
     }
     if (!w.begun) return queueErr(c, "write: data before begin", .{});
     if (payload.len == 0) {
         endWrite(d, null);
-        try c.framer.queue(.ack, "");
+        try c.framer.queue(.{ .ack = "" });
         return;
     }
     try d.session.send(payload);
     // Per-chunk ack is the backpressure signal: deferred while pty_input is
     // backed up so the client (which blocks on recv) can't outrun the PTY.
     if (d.session.pendingInput().len < write_backpressure)
-        try c.framer.queue(.ack, "")
+        try c.framer.queue(.{ .ack = "" })
     else
         w.ack_pending = true;
 }
@@ -1069,15 +1075,15 @@ fn releaseWriteAck(d: *Daemon) void {
     if (d.session.state().preexec_gen == w.preexec_at_begin) return;
     if (d.session.pendingInput().len >= write_backpressure) return;
     w.ack_pending = false;
-    if (d.findClient(w.client_id)) |wc| queueOrClose(wc, .ack, "");
+    if (d.findClient(w.client_id)) |wc| queueOrClose(wc, .{ .ack = "" });
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
 
-/// Queue a frame, marking the client closed on failure (the only realistic
+/// Queue a message, marking the client closed on failure (the only realistic
 /// failure is OOM, at which point dropping the client is the best option).
-fn queueOrClose(c: *Client, tag: ipc.Tag, payload: []const u8) void {
-    c.framer.queue(tag, payload) catch {
+fn queueOrClose(c: *Client, msg: ipc.Msg) void {
+    c.framer.queue(msg) catch {
         c.closed = true;
     };
 }
@@ -1085,18 +1091,18 @@ fn queueOrClose(c: *Client, tag: ipc.Tag, payload: []const u8) void {
 fn queueErr(c: *Client, comptime fmt: []const u8, args: anytype) !void {
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
-    try c.framer.queue(.err, msg);
+    try c.framer.queue(.{ .err = msg });
 }
 
-/// Queue `data` as one or more `tag` frames, each ≤ `chunk` bytes.
-fn queueChunked(c: *Client, tag: ipc.Tag, data: []const u8, chunk: usize) !void {
+/// Queue `data` as one or more bulk frames of `tag`, each ≤ `chunk` bytes.
+fn queueChunked(c: *Client, comptime tag: ipc.Tag, data: []const u8, chunk: usize) !void {
     var off: usize = 0;
     while (off < data.len) {
         const end = @min(off + chunk, data.len);
-        try c.framer.queue(tag, data[off..end]);
+        try c.framer.queue(@unionInit(ipc.Msg, @tagName(tag), data[off..end]));
         off = end;
     }
-    if (data.len == 0) try c.framer.queue(tag, "");
+    if (data.len == 0) try c.framer.queue(@unionInit(ipc.Msg, @tagName(tag), ""));
 }
 
 /// Connect to `path` as a probe. Returns the connected fd if a daemon answers.
